@@ -57,6 +57,13 @@
   .qwin .qreset { flex: none; color: var(--dim); font-size: 11px; }
   .qerr { color: var(--red); font-size: 11.5px; }
   .qplan { color: var(--dim); font-size: 11px; margin-top: 4px; }
+  /* 加权依据：剩余额度均值 → 程序算出的有效权重（看得见「为什么这个账号更容易被选中」） */
+  .qweight { color: var(--dim); font-size: 11px; margin-top: 3px; white-space: nowrap; }
+  .qweight b { color: var(--text); font-family: Consolas, monospace; }
+  .wcalc { color: var(--dim); font-size: 11px; margin-top: 2px; white-space: nowrap; }
+  .wcalc b { color: var(--accent); font-family: Consolas, monospace; }
+  /* 实时并发占用（当前/上限），由 /api/runtime 轮询就地更新 */
+  .loadcell { color: var(--dim); font-size: 11px; font-family: Consolas, monospace; margin-top: 2px; }
   tr.row-new td { animation: newflash 4s ease-out; }
   @keyframes newflash { 0% { background: #1f3d2a; } 70% { background: #1f3d2a; } 100% { background: transparent; } }
   /* 上游优先级/排除面板 */
@@ -138,8 +145,9 @@
     <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
       <label class="dim" style="font-size:13px">模式：</label>
       <select id="accMode">
+        <option value="weighted">按额度权重（剩余多优先）</option>
+        <option value="roundrobin">账号池轮询（等权）</option>
         <option value="single">单账号（手动指定）</option>
-        <option value="roundrobin">账号池轮询</option>
       </select>
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
       <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
@@ -148,9 +156,20 @@
       <span class="dim" style="font-size:12px" id="accMsg"></span>
       <span class="dim" style="font-size:12px" id="quotaMsg"></span>
     </div>
+    <div style="display:flex; gap:14px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
+      <span class="dim" style="font-size:12.5px">并发闸门：</span>
+      <label class="dim" style="font-size:12px" title="账号没单独填并发时用的默认值">默认并发 <input id="tunAccConc" type="number" min="1" max="1000" step="1" style="width:62px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px"></label>
+      <label class="dim" style="font-size:12px" title="整个账号池允许的同时在飞请求数上限，0 = 不限制">池总并发 <input id="tunPoolConc" type="number" min="0" max="10000" step="1" style="width:62px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px"></label>
+      <label class="dim" style="font-size:12px" title="所有账号都满时，请求最多排队等待多久；0 = 不排队，直接返回 503">排队超时 <input id="tunQueueMs" type="number" min="0" max="3600" step="1" style="width:70px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px"> 秒</label>
+      <label class="dim" style="font-size:12px" title="上游真的回 429 时，先退避等待再重试几次（重试时会把并发名额让给排队的请求）">429 重试 <input id="tunRetry429" type="number" min="0" max="10" step="1" style="width:54px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px"> 次</label>
+      <span id="poolMsg" class="dim" style="font-size:12px"></span>
+    </div>
+    <div class="dim" style="font-size:12px; margin-bottom:8px">
+      并发满时请求原地排队等待（不再向上游猛打、也不会回 429）；「按额度权重」= 每次取号按「5小时/本周/本月」三个窗口剩余额度的平均值加权随机，剩余多的账号被选中概率更高，不做会话粘性（缓存跨账号共享）。额度与权重用同一份快照，按 <code>quotaRefreshMs</code> 的周期自动刷新（默认 15 分钟），想立刻更新点「↻ 刷新额度」。
+    </div>
     <table>
-      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>额度（5小时 / 本周 / 本月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
-      <tbody id="accBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>并发</th><th>权重</th><th>额度（5小时 / 本周 / 本月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
+      <tbody id="accBody"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -202,10 +221,17 @@
   </div>
 
   <div class="card">
-    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h2 style="margin:0">请求历史（最近 100 条，经代理的请求自动记录）</h2>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <button class="ghost" onclick="refreshHistory(this)" id="histBtn">↻ 刷新历史</button>
+        <label class="dim" style="font-size:12px"><input type="checkbox" id="histAuto" onchange="toggleHistAuto()"> 自动刷新（5 秒）</label>
+        <span class="dim" style="font-size:12px" id="histMsg"></span>
+      </div>
+    </div>
     <table>
-      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
-      <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
+      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>排队 / 重试</th><th>方式</th><th>尝试序列</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="9" class="empty">暂无记录</td></tr></tbody>
     </table>
   </div>
 
@@ -391,6 +417,7 @@ async function loadAll() {
   const [models, accs, sec, meta] = await Promise.all([api('/api/models'), api('/api/accounts'), api('/api/security'), api('/api/meta')]);
   DATA = models;
   ACCS = accs;
+  RUNTIME = accs.runtime || RUNTIME;
   render();
   renderAccounts();
   renderSecurity(sec);
@@ -399,6 +426,8 @@ async function loadAll() {
   loadQuota(false).then(() => {
     const el = document.activeElement;
     if (!el || typeof el.closest !== 'function' || !el.closest('#accBody')) renderAccounts();
+    // 额度到位后再刷一次运行态，让「剩余均值 → 权重」首屏就是真实值
+    return pollRuntime();
   });
 }
 
@@ -671,18 +700,57 @@ function bulkUp(id, action) {
 
 async function loadHistory() {
   const { history } = await api('/api/history');
-  $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${h.model}</td>
-      <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
-      <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
-      <td class="mono dim">${h.canonical || '—'}</td>
+  $('#histBody').innerHTML = history.length ? history.map((h) => {
+    // 排队/重试单列出来：这就是「到底有没有在排队」的直接证据
+    const wait = [];
+    if (h.queuedMs) wait.push(`排队 ${h.queuedMs}ms`);
+    if (h.rateRetries) wait.push(`429 重试 ${h.rateRetries} 次`);
+    // 这些字段全部来自请求/上游（h.model 就是客户端自报的 model），必须转义后再拼 HTML，
+    // 否则一条 "<img src=x onerror=...>" 的请求就能变成控制台里的存储型 XSS。
+    const traceTxt = (h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ');
+    return `<tr>
+      <td>${fmt(h.ts)}</td><td class="mono">${escapeHtml(h.model)}</td>
+      <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td>${h.provider ? '<span class="badge">' + escapeHtml(h.provider) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td class="mono dim">${escapeHtml(h.canonical || '—')}</td>
       <td>${h.ms ?? '—'} ms</td>
+      <td class="dim">${wait.length ? escapeHtml(wait.join(' · ')) : '—'}</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
-    </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+      <td class="dim">${escapeHtml(traceTxt) || '—'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="9" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+  const el = $('#histMsg');
+  if (el) el.textContent = history.length ? `共 ${history.length} 条 · 更新于 ${fmt(Date.now())}` : '';
+}
+
+// 手动刷新历史：按钮带「刷新中…」状态，避免连点
+async function refreshHistory(btn) {
+  const b = btn || $('#histBtn');
+  const label = b && b.textContent;
+  if (b) { b.disabled = true; b.textContent = '↻ 刷新中…'; }
+  try {
+    await loadHistory();
+  } catch (e) {
+    const el = $('#histMsg');
+    if (el) el.textContent = '刷新失败：' + (e.message || e);
+  } finally {
+    if (b) { b.disabled = false; b.textContent = label || '↻ 刷新历史'; }
+  }
+}
+
+// 可选自动刷新：开着看调试时用，默认关闭（历史是本地记录，不需要一直拉）
+let histTimer = null;
+function toggleHistAuto() {
+  clearInterval(histTimer);
+  histTimer = null;
+  if ($('#histAuto')?.checked) {
+    refreshHistory();
+    histTimer = setInterval(() => { if (!document.hidden) refreshHistory(); }, 5000);
+  }
 }
 
 let ACCS = null;
+let RUNTIME = null;   // /api/runtime 的运行态快照（各账号实时并发占用与有效权重）
 const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 // ---- 额度（订阅滚动窗口用量）----
@@ -700,10 +768,12 @@ function fmtReset(iso) {
 }
 
 function renderQuotaCell(name, i) {
-  if (!QUOTA) return '<span class="dim">—</span>';
-  const q = QUOTA.accounts.find((a) => a.name === name) || QUOTA.accounts[i];
-  if (!q) return '<span class="dim">—</span>';
-  if (!q.ok) return `<span class="qerr" title="${escapeHtml(q.error || '读取失败')}">读取失败</span>`;
+  // 后面追加的「剩余均值」行由 pollRuntime 就地更新，所以这里给个固定 id
+  const weightLine = `<div class="qweight" id="accQW${i}">${headroomText(rtOf(name))}</div>`;
+  if (!QUOTA) return `<span class="dim">—</span>` + weightLine;
+  const q = QUOTA.accounts.find((a) => a.name === name);
+  if (!q) return `<span class="dim">—</span>` + weightLine;
+  if (!q.ok) return `<span class="qerr" title="${escapeHtml(q.error || '读取失败')}">读取失败</span>` + weightLine;
   const rows = (q.windows || []).map((w) => {
     const known = w.percent !== null && w.percent !== undefined;
     const pct = known ? Math.max(0, Math.min(100, w.percent)) : 0;
@@ -725,7 +795,35 @@ function renderQuotaCell(name, i) {
   const plan = q.planName
     ? `<div class="qplan" title="${escapeHtml(planParts.join('，'))}">${escapeHtml(q.planName)}${q.cancelAt ? ' · 到期不续费' : ''}${q.planActive === false ? ' · 已失效' : ''}</div>`
     : '';
-  return rows + plan;
+  return rows + plan + weightLine;
+}
+
+// 运行态按账号名取数据。绝不按「数组下标」回退：运行态与控制台表格的行序不一定一致
+// （表格渲染全部账号，运行态可能少项），一旦回退就会把别的账号的占用/权重显示到这一行上。
+function rtOf(name) {
+  return (RUNTIME?.accounts || []).find((a) => a.name === name) || null;
+}
+
+// 额度单元格尾部：加权选号的依据 —— 三个窗口剩余额度的平均值
+function headroomText(rt) {
+  if (!rt) return '';
+  const head = rt.headroom === null || rt.headroom === undefined ? '额度未知' : `${rt.headroom}%`;
+  return `<span title="加权依据：5小时 / 本周 / 本月三个窗口剩余额度（100-已用）的平均值">剩余均值 <b>${head}</b></span>`;
+}
+
+// 权重单元格尾部：程序自己算出来、真正用于加权随机的那个权重。
+// 「已让路」只在 weighted 模式下才写 —— single / roundrobin 不看权重，标成让路就是与真实行为不符。
+function weightText(rt) {
+  if (!rt) return '';
+  if (rt.enabled === false) return '<span class="dim" title="该账号未启用，不参与选号">已停用</span>';
+  const base = `计算权重 <b>${rt.weight}</b>`;
+  if (rt.blocked) return `<span title="当前不会参与选号">${base} · <span style="color:var(--red)">已让路</span></span>`;
+  const reason = rt.quotaStop ? '额度触顶' : rt.weightZero ? '手动倍数为 0' : null;
+  if (reason && !RUNTIME?.weighted) {
+    return `<span title="该条件只在「按额度权重」模式下决定选号；当前模式不按权重选号">${base} <span class="dim">· ${reason}（当前模式不按权重选号）</span></span>`;
+  }
+  const how = rt.manualWeight !== 1 ? `剩余均值 × 手动倍数 ${rt.manualWeight}` : '等于剩余均值';
+  return `<span title="程序算出的有效权重（${how}），加权随机用它：权重越大越容易被选中">${base}</span>`;
 }
 
 async function loadQuota(force) {
@@ -735,7 +833,11 @@ async function loadQuota(force) {
     QUOTA = null;
   }
   const el = $('#quotaMsg');
-  if (el) el.textContent = QUOTA?.fetchedAt ? `额度更新于 ${fmt(QUOTA.fetchedAt)}` : '';
+  if (el) {
+    // 额度与由它算出的权重是同一个快照，所以这里把刷新节奏一并写清楚
+    const mins = Math.max(1, Math.round((QUOTA?.ttlMs ?? 900000) / 60000));
+    el.textContent = QUOTA?.fetchedAt ? `额度更新于 ${fmt(QUOTA.fetchedAt)} · 每 ${mins} 分钟自动刷新` : '';
+  }
 }
 
 async function refreshQuota() {
@@ -752,15 +854,25 @@ async function refreshQuota() {
 function renderAccounts() {
   if (!ACCS) return;
   $('#accMode').value = ACCS.mode;
+  const t = ACCS.tuning || {};
+  setIfIdle('#tunAccConc', t.accountConcurrency ?? 5);
+  setIfIdle('#tunPoolConc', t.poolConcurrency ?? 0);
+  setIfIdle('#tunQueueMs', Math.round((t.queueTimeoutMs ?? 120000) / 1000));
+  setIfIdle('#tunRetry429', t.retry429 ?? 0);
   const show = $('#accShowKeys').checked;
   const rows = ACCS.accounts.map((a, i) => {
     const st = (ACCS.stats || {})[a.name] || {};
     const checked = ACCS.mode === 'single' && i === ACCS.active;
+    const rt = rtOf(a.name) || {};
     return `<tr>
-      <td><input type="radio" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="轮询模式下按顺序轮流使用"' : 'title="单账号模式下使用此账号"'}></td>
+      <td><input type="radio" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="该模式按规则自动选号，不指定固定账号"' : 'title="单账号模式下使用此账号"'}></td>
       <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
       <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
       <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
+      <td><input class="accConc" data-i="${i}" type="number" min="1" max="1000" step="1" value="${a.concurrency ?? (t.accountConcurrency ?? 5)}" style="width:58px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 6px; font-size:12.5px">
+        <div class="loadcell" id="accLoad${i}" title="当前占用 / 该账号并发上限">${rt.limit ? `${rt.active ?? 0}/${rt.limit}` : '—'}</div></td>
+      <td><input class="accWeight" data-i="${i}" type="number" min="0" max="100" step="0.5" value="${a.weight ?? 1}" style="width:58px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 6px; font-size:12.5px">
+        <div class="wcalc" id="accW${i}" title="程序自己算出的权重">${weightText(rt)}</div></td>
       <td>${renderQuotaCell(a.name, i)}</td>
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
@@ -770,34 +882,92 @@ function renderAccounts() {
       </div></td>
     </tr>`;
   }).join('');
-  $('#accBody').innerHTML = rows || '<tr><td colspan="8" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
+  $('#accBody').innerHTML = rows || '<tr><td colspan="10" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
+  renderPoolMsg();
 }
 
+// 只在用户没有正在编辑该输入框时回填，避免轮询把正在输入的值顶掉
+function setIfIdle(sel, val) {
+  const el = $(sel);
+  if (!el || document.activeElement === el) return;
+  el.value = val;
+}
+
+function renderPoolMsg() {
+  const el = $('#poolMsg');
+  if (!el || !RUNTIME) return;
+  const parts = [`占用 ${RUNTIME.total}/${RUNTIME.limit || '不限'}`];
+  if (RUNTIME.queued) parts.push(`排队 ${RUNTIME.queued}`);
+  parts.push(`模式 ${RUNTIME.mode === 'weighted' ? '额度权重' : RUNTIME.mode === 'roundrobin' ? '轮询' : '单账号'}`);
+  el.textContent = '运行中：' + parts.join(' · ');
+}
+
+// 轮询运行态：只就地更新「占用」与「权重」两处，不整表重渲染（否则会打断正在编辑的输入）
+async function pollRuntime() {
+  if (document.hidden || !ACCS) return;
+  try { RUNTIME = await api('/api/runtime'); } catch { return; }
+  // 以「表格自己的行序」为基准，逐行按名字取运行态：DOM id 与行号一一对应，不会错位
+  (ACCS?.accounts || []).forEach((row, i) => {
+    const rt = (RUNTIME.accounts || []).find((r) => r.name === row.name) || null;
+    const load = $(`#accLoad${i}`);
+    if (load) load.textContent = !rt || rt.enabled === false ? (rt ? '已停用' : '—') : (rt.limit ? `${rt.active}/${rt.limit}` : '—');
+    const wl = $(`#accQW${i}`);
+    if (wl) wl.innerHTML = headroomText(rt);
+    const wc = $(`#accW${i}`);
+    if (wc) wc.innerHTML = weightText(rt);
+  });
+  renderPoolMsg();
+}
+setInterval(pollRuntime, 3000);
+
 // 把 DOM 里当前编辑值收回 ACCS（避免重渲染丢输入）
+// 数字输入取值：空 = 保持原值（不是 0）。以前用 Number(v)||0，把「排队超时」清空就会静默写成 0，
+// 而 0 在服务端的意思是"不排队、并发满直接 503" —— 等于把排队功能关掉了还不提示。
+function numField(sel, dflt) {
+  const el = $(sel);
+  if (!el) return dflt;
+  const raw = String(el.value ?? '').trim();
+  if (raw === '') return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : dflt;
+}
+
 function collectAccounts() {
   const mode = $('#accMode').value;
+  const t0 = ACCS.tuning || {};
   const accs = ACCS.accounts.map((a, i) => ({
     name: document.querySelector(`.accName[data-i="${i}"]`)?.value?.trim() || a.name,
     key: document.querySelector(`.accKey[data-i="${i}"]`)?.value?.trim() || '',
     enabled: document.querySelector(`.accEnabled[data-i="${i}"]`)?.checked !== false,
+    concurrency: numField(`.accConc[data-i="${i}"]`, a.concurrency ?? t0.accountConcurrency ?? 5),
+    weight: numField(`.accWeight[data-i="${i}"]`, a.weight ?? 1),
   }));
   const checked = document.querySelector('input[name="accActive"]:checked');
   const active = checked ? parseInt(checked.dataset.i) : Math.min(ACCS.active ?? 0, Math.max(0, accs.length - 1));
-  return { accounts: accs, mode, active };
+  const tuning = {
+    accountConcurrency: numField('#tunAccConc', t0.accountConcurrency ?? 5),
+    poolConcurrency: numField('#tunPoolConc', t0.poolConcurrency ?? 0),
+    queueTimeoutMs: Math.round(numField('#tunQueueMs', Math.round((t0.queueTimeoutMs ?? 120000) / 1000)) * 1000),
+    retry429: numField('#tunRetry429', t0.retry429 ?? 0),
+  };
+  return { accounts: accs, mode, active, tuning };
 }
 
 async function saveAccounts() {
   const payload = collectAccounts();
   if (!payload.accounts.filter((a) => a.key).length) { accMsg('至少需要一个 key 非空的账号', true); return; }
   const r = await api('/api/accounts', payload);
-  if (r.ok) { accMsg(`已保存：${r.accounts} 个账号 · ${r.mode === 'roundrobin' ? '轮询' : '单账号'}模式`); await loadAll(); }
-  else accMsg(r.error?.message || '保存失败', true);
+  if (r.ok) {
+    const label = { weighted: '按额度权重', roundrobin: '轮询', single: '单账号' }[r.mode] || r.mode;
+    accMsg(`已保存：${r.accounts} 个账号 · ${label}模式 · 排队上限 ${Math.round((r.tuning?.queueTimeoutMs ?? 0) / 1000)}s`);
+    await loadAll();
+  } else accMsg(r.error?.message || '保存失败', true);
 }
 
 function addAccountRow() {
   const cur = collectAccounts();
-  cur.accounts.push({ name: `账号${cur.accounts.length + 1}`, key: '', enabled: true });
-  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = cur.active;
+  cur.accounts.push({ name: `账号${cur.accounts.length + 1}`, key: '', enabled: true, concurrency: cur.tuning?.accountConcurrency ?? 5, weight: 1 });
+  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = cur.active; ACCS.tuning = cur.tuning;
   renderAccounts();
   const last = document.querySelectorAll('.accKey');
   if (last.length) last[last.length - 1].focus();
@@ -806,7 +976,7 @@ function addAccountRow() {
 function delAccount(i) {
   const cur = collectAccounts();
   cur.accounts.splice(i, 1);
-  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = Math.min(cur.active, Math.max(0, cur.accounts.length - 1));
+  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = Math.min(cur.active, Math.max(0, cur.accounts.length - 1)); ACCS.tuning = cur.tuning;
   renderAccounts();
 }
 

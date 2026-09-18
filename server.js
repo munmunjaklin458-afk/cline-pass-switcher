@@ -25,8 +25,18 @@ const DEFAULT_CONFIG = {
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
-  accountMode: 'single',   // single=手动指定 | roundrobin=轮询
+  accountMode: 'single',   // single=手动指定 | roundrobin=轮询 | weighted=按额度权重加权随机
   activeAccount: 0,        // single 模式下使用的账号下标
+  // ---- 并发闸门与加权选号 ----
+  // 目标：并发超限时排队等待，绝不本地回 429；加权只按「额度剩余」算，不绑定会话、不做粘性。
+  accountConcurrency: 5,   // 未单独设置 concurrency 的账号使用的默认并发
+  poolConcurrency: 0,      // 账号池总并发上限；0 = 不限制
+  queueTimeoutMs: 120000,  // 并发满时的排队等待上限；0 = 不排队（立即回 503）
+  // 上游真 429 时的退避重试；totalTimeoutMs 限住整条请求花在重试上的总时长，避免一条请求拖到分钟级
+  retry429: { retries: 3, baseDelayMs: 1500, maxDelayMs: 20000, totalTimeoutMs: 120000 },
+  quotaWeights: { five_hour: 1, weekly: 1, monthly: 1 },           // 三窗口剩余做加权平均时各窗口的权重
+  quotaStopPercent: 100,   // 任一窗口「已用」达到该值时该账号退出加权（100 = 真正用满才让路）
+  quotaRefreshMs: 900000,  // 选号用额度快照的后台刷新间隔
   knownModels: [
     'cline-pass/glm-5.3-flash',
     'cline-pass/kimi-k3',
@@ -62,7 +72,24 @@ function loadJson(file, fallback) {
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
 const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+// metadata.json 每次请求都会变（历史/统计），但每个请求都全量重写一遍既慢又会放大磁盘写入。
+// 这里合并成「最多 1 秒落盘一次」，退出前 flush，最多丢 1 秒的诊断数据。
+let metaTimer = null;
+let metaDirty = false;
+function saveMetaNow() {
+  metaDirty = false;
+  try { fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2)); } catch (e) { console.error('[元数据写入失败]', e.message); }
+}
+function flushMeta() {
+  if (metaTimer) { clearTimeout(metaTimer); metaTimer = null; }
+  if (metaDirty) saveMetaNow();
+}
+function saveMeta() {
+  metaDirty = true;
+  if (metaTimer) return;
+  metaTimer = setTimeout(() => { metaTimer = null; if (metaDirty) saveMetaNow(); }, 1000);
+  metaTimer.unref?.();
+}
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -70,7 +97,8 @@ if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.
   config.activeAccount = 0;
   saveConfig();
 }
-config.accountMode = config.accountMode === 'roundrobin' ? 'roundrobin' : 'single';
+const ACCOUNT_MODES = new Set(['single', 'roundrobin', 'weighted']);
+config.accountMode = ACCOUNT_MODES.has(config.accountMode) ? config.accountMode : 'single';
 
 // perModel 配置升级：旧版单 upstream 迁移为有序多上游列表（upstream 保留为回滚兼容镜像）
 (function migratePerModel() {
@@ -103,21 +131,294 @@ if (!isConfigured()) {
   console.warn('[提示] 尚未配置上游 API Key：打开控制台「账号管理」添加账号并保存即可；服务已启动。');
 }
 
-// 账号选择：roundrobin 在启用的账号间轮询；single 使用 activeAccount 指定的账号
+// ---------- 账号选择与并发闸门 ----------
+// 三种模式：
+//   single     只用 activeAccount 指定的账号（该账号并发满则排队等它）
+//   roundrobin 在启用账号间顺序轮询（并发已满的账号自动跳过，不空转）
+//   weighted   按额度权重加权随机：剩余额度越多，被抽中的概率越高（本需求的主模式）
+// 关键约定：
+// 1) 权重只在「取号」这一刻计算，不绑定会话、不做粘性；每条请求独立按权重抽一次。
+// 2) 并发超限时排队等待，绝不向客户端回 429（429 只可能来自上游，见 retry429 退避重试）。
+// 3) 名额在整条请求生命周期内持有（含流式透传），请求结束/断开/出错都必须归还。
 let RR_COUNTER = 0;
+
+// 注意 Number(null)===0、Number('')===0：缺省必须靠「是不是空值」判断，不能靠 Number() 的结果，
+// 否则 weight:null 会被静默写成 0（该账号被排出加权）、concurrency:null 会变成 1。
+// 显式传 0 仍然是合法的 0（例如 queueTimeoutMs=0 = 不排队）。
+const numOrNull = (v) => (v === null || v === undefined || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+const clampInt = (v, lo, hi, dflt) => {
+  const n = numOrNull(v);
+  if (n === null) return dflt;
+  return Math.min(hi, Math.max(lo, Math.floor(n)));
+};
+const clampNum = (v, lo, hi, dflt) => {
+  const n = numOrNull(v);
+  if (n === null) return dflt;
+  return Math.min(hi, Math.max(lo, n));
+};
+
 function enabledAccounts() {
   return (config.accounts || []).filter((a) => a && a.key && a.enabled !== false);
 }
+
+// 启用中的账号列表（补显示名）。下标按 config.accounts 原始位置生成，
+// 与 quotaSnapshot / META.stats 的命名规则保持一致（三处都靠「账号名」对齐）。
+function accountList() {
+  const all = config.accounts || [];
+  const list = [];
+  all.forEach((a, i) => {
+    if (a && a.key && a.enabled !== false) list.push({ ...a, name: String(a.name || `账号${i + 1}`) });
+  });
+  if (!list.length && config.apiKey) return [{ name: '默认', key: config.apiKey, enabled: true }];
+  return list;
+}
+
+function accountConcurrencyOf(a) {
+  const own = Number(a?.concurrency);
+  if (Number.isFinite(own) && own > 0) return clampInt(own, 1, 1000, 5);
+  return clampInt(config.accountConcurrency, 1, 1000, 5);
+}
+function poolLimit() {
+  const n = Number(config.poolConcurrency);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : Infinity;
+}
+function queueTimeout() {
+  return clampInt(config.queueTimeoutMs, 0, 3600e3, 120000);
+}
+// 429 重试计划。totalTimeoutMs 是「整条请求用于 429 重试的总预算」：
+// 没有它时，retries=3 + attemptTimeoutMs=120s 最坏能把一条请求拖到 8 分钟，客户端早就超时了。
+function retry429Plan() {
+  const c = config.retry429 || {};
+  const retries = clampInt(c.retries, 0, 10, 0);
+  const base = clampInt(c.baseDelayMs, 0, 60000, 0);
+  const max = clampInt(c.maxDelayMs, base, 300000, base);
+  return { retries, baseDelayMs: base, maxDelayMs: max, totalTimeoutMs: clampInt(c.totalTimeoutMs, 1000, 900e3, 120000) };
+}
+
+// 额度剩余（0~100）按 quotaWeights 做加权平均；读不到额度返回 null。
+// 权重口径（用户指定）：三个窗口剩余的平均值 —— 哪个窗口先撞上限都算进去，不只看单窗口。
+const UNKNOWN_HEADROOM = 50;   // 额度未知时的中性余量：不清零，否则额度接口抖动会把账号饿死
+function accountHeadroom(q) {
+  if (!q || !q.ok) return null;
+  let num = 0, den = 0;
+  for (const w of q.windows || []) {
+    const p = Number(w?.percent);
+    if (!Number.isFinite(p)) continue;
+    const gw = Number(config.quotaWeights?.[w.type]);
+    const k = Number.isFinite(gw) && gw >= 0 ? gw : 1;
+    num += Math.max(0, 100 - p) * k;
+    den += k;
+  }
+  return den > 0 ? num / den : null;
+}
+// 任一窗口「已用」达到 quotaStopPercent 就让该账号退出加权（默认 100 = 真正用满才让路）
+function quotaBlocked(q) {
+  const stop = Number(config.quotaStopPercent);
+  if (!Number.isFinite(stop) || stop <= 0) return false;
+  return (q?.windows || []).some((w) => Number.isFinite(Number(w?.percent)) && Number(w.percent) >= stop);
+}
+// 有效权重 = 额度剩余均值 × 手动 weight（默认 1）；weight=0 表示该账号不参与加权
+function accountWeight(a, q) {
+  const manual = clampNum(a?.weight, 0, 100, 1);
+  const head = accountHeadroom(q);
+  const base = head === null ? UNKNOWN_HEADROOM : head;
+  return { weight: base * manual, headroom: head, manual, blocked: quotaBlocked(q) };
+}
+function quotaByName(name) {
+  return (quotaCache.accounts || []).find((a) => a.name === name) || null;
+}
+
+// 并发闸门状态：per-account 计数 + 池总量 + FIFO 等待队列
+const pool = { total: 0, active: new Map(), queue: [] };
+const activeOf = (name) => pool.active.get(name) || 0;
+
+// 按模式圈定候选账号（这里只按模式过滤，不再按并发过滤；并发在 allocateSlot 里判断）
+function eligibleAccounts() {
+  const list = accountList();
+  if (!list.length) return [];
+  if (config.accountMode !== 'single') return list;
+  const all = config.accounts || [];
+  const idx = clampInt(config.activeAccount, 0, Math.max(0, all.length - 1), 0);
+  const want = all[idx];
+  if (want && want.key && want.enabled !== false) {
+    const name = String(want.name || `账号${idx + 1}`);
+    const hit = list.find((a) => a.name === name);
+    if (hit) return [hit];
+  }
+  return list;
+}
+
+// 加权随机抽一个账号；cands 为空（例如所有账号并发都满了）返回 null，由调用方决定排队
+function weightedPick(cands) {
+  if (!cands || !cands.length) return null;
+  const scored = cands.map((a) => {
+    const w = accountWeight(a, quotaByName(a.name));
+    return { a, w: w.blocked ? 0 : w.weight };
+  });
+  // 全部被额度阈值挡下（或手动权重全是 0）时退化为等概率，避免账号池直接不可用
+  const usable = scored.filter((s) => s.w > 0);
+  const list = usable.length ? usable : scored.map((s) => ({ a: s.a, w: 1 }));
+  const total = list.reduce((s, x) => s + x.w, 0);
+  let r = Math.random() * total;
+  for (const x of list) { r -= x.w; if (r <= 0) return x.a; }
+  return list[list.length - 1].a;
+}
+
+// 真正分配一个名额：池总量未满 + 目标账号未满
+function allocateSlot() {
+  if (pool.total >= poolLimit()) return null;
+  const cands = eligibleAccounts();
+  if (!cands.length) return null;
+  const hasRoom = (a) => activeOf(a.name) < accountConcurrencyOf(a);
+  let pick = null;
+  if (config.accountMode === 'weighted') {
+    pick = weightedPick(cands.filter(hasRoom));
+  } else if (config.accountMode === 'roundrobin') {
+    // 从上次的位置往后找第一个还有空闲名额的账号：满了就跳过，不空转
+    const n = cands.length;
+    const start = n ? RR_COUNTER % n : 0;
+    for (let i = 0; i < n; i++) {
+      const a = cands[(start + i) % n];
+      if (hasRoom(a)) { pick = a; RR_COUNTER = (start + i + 1) % 1000000000; break; }
+    }
+  } else {
+    const a = cands[0];
+    if (a && hasRoom(a)) pick = a;
+  }
+  if (!pick) return null;
+  pool.total += 1;
+  pool.active.set(pick.name, activeOf(pick.name) + 1);
+  return { name: pick.name, key: pick.key, concurrency: accountConcurrencyOf(pick), released: false };
+}
+
+function releaseSlot(lease) {
+  if (!lease || lease.released) return;
+  lease.released = true;
+  pool.total = Math.max(0, pool.total - 1);
+  pool.active.set(lease.name, Math.max(0, activeOf(lease.name) - 1));
+  drainQueue();
+}
+
+// 名额释放后按 FIFO 把名额发给等待者（已取消/超时/对端已断开的等待者原地丢弃）
+function drainQueue() {
+  for (;;) {
+    while (pool.queue.length && pool.queue[0].done) pool.queue.shift();
+    if (!pool.queue.length) return;
+    const lease = allocateSlot();
+    if (!lease) return;
+    const w = pool.queue.shift();
+    // w.done：已超时或已被 close 事件取消；w.gone()：对端其实已经走了，但服务端还没收到 close
+    // （实测 undici 客户端 abort 后服务端 close 事件可能滞后甚至不到达）。这种情况不能再发名额，
+    // 否则会替一个已经离开的客户端白占并发、白烧上游额度。
+    if (w.done || w.gone()) {
+      // 名额直接还回去（不能调 releaseSlot，否则会递归重入 drainQueue）
+      pool.total = Math.max(0, pool.total - 1);
+      pool.active.set(lease.name, Math.max(0, activeOf(lease.name) - 1));
+      continue;
+    }
+    w.resolve(lease);
+  }
+}
+
+// 取号：有空闲立即返回；否则进 FIFO 队列等待；排队超时/客户端断开则 reject（绝不回 429）
+function acquireSlot(req, res, timeoutMs) {
+  quotaPeek();   // 过期就丢一个后台刷新（不阻塞）：single/roundrobin 下也要能续期
+  if (!eligibleAccounts().length) {
+    return Promise.reject(Object.assign(new Error('尚未配置可用的上游账号：请在控制台「账号管理」添加账号并启用'), { code: 'NO_ACCOUNT' }));
+  }
+  const got = allocateSlot();
+  if (got) return Promise.resolve(got);
+  const waitMs = clampInt(timeoutMs, 0, 3600e3, 120000);
+  if (waitMs <= 0) {
+    return Promise.reject(Object.assign(new Error('账号并发已满且未开启排队（queueTimeoutMs=0）'), { code: 'BUSY' }));
+  }
+  return new Promise((resolve, reject) => {
+    // 对端是否已经走了。注意：不能看 req.destroyed —— 请求体读完后它本来就是 true/false 都不可靠；
+    // 真正可靠的是 socket 是否已销毁（实测客户端 abort 后 socket.destroyed 会变 true）。
+    // 另外 req 的 'close' 事件在「请求体读完」时就已经发过了（Node ≥16 语义），
+    // 所以我们这里注册的 close 监听多数情况下不会再触发，只能当兜底，主力判定是 gone()。
+    const w = {
+      done: false,
+      resolve: null,
+      reject: null,
+      timer: null,
+      gone: () => !!(req?.socket?.destroyed || res?.destroyed),
+    };
+    const onClose = () => w.reject(Object.assign(new Error('客户端在排队期间断开连接'), { code: 'CLIENT_CLOSED' }));
+    w.resolve = (lease) => {
+      if (w.done) return;
+      w.done = true; clearTimeout(w.timer); req?.off?.('close', onClose);
+      resolve(lease);
+    };
+    w.reject = (err) => {
+      if (w.done) return;
+      w.done = true; clearTimeout(w.timer); req?.off?.('close', onClose);
+      reject(err);
+    };
+    w.timer = setTimeout(() => w.reject(Object.assign(new Error(`账号并发已满，排队 ${waitMs}ms 仍未取得名额`), { code: 'QUEUE_TIMEOUT' })), waitMs);
+    pool.queue.push(w);
+    req?.once?.('close', onClose);
+  });
+}
+
+// 运行态快照（控制台展示实时并发占用与各账号的有效权重）
+function poolSnapshot() {
+  const limit = poolLimit();
+  const weighted = config.accountMode === 'weighted';
+  // 这里必须列出「全部账号（含禁用/无 key）」，且名字规则与 quotaSnapshot 完全一致：
+  // 控制台表格是按配置里的账号逐行渲染的，运行态少一项就会让「按下标回退」把别的账号的数字显示到这一行上。
+  const accounts = (config.accounts || []).map((a, i) => {
+    const name = String(a?.name || `账号${i + 1}`);
+    const enabled = !!(a && a.key && a.enabled !== false);
+    const info = accountWeight(a, quotaByName(name));
+    const weightBlocked = info.blocked || info.weight <= 0;
+    return {
+      name,
+      enabled,
+      active: activeOf(name),
+      limit: accountConcurrencyOf(a),
+      weight: Math.round(info.weight * 100) / 100,
+      manualWeight: info.manual,
+      headroom: info.headroom === null ? null : Math.round(info.headroom * 10) / 10,
+      // blocked = 「当下真的不会参与选号」：只有 weighted 模式才由权重/额度阈值决定；
+      // single / roundrobin 不看权重，标成"已让路"就是骗人（实测 weight=0 时仍 100% 走该账号）。
+      blocked: weighted && enabled && weightBlocked,
+      quotaStop: info.blocked,          // 原始原因：额度触顶
+      weightZero: info.weight <= 0,     // 原始原因：手动倍数 0
+    };
+  });
+  return {
+    mode: config.accountMode,
+    weighted,
+    total: pool.total,
+    limit: limit === Infinity ? 0 : limit,
+    queued: pool.queue.filter((w) => !w.done).length,
+    queueTimeoutMs: queueTimeout(),
+    quotaAt: quotaCache.at || 0,
+    quotaRefreshMs: quotaTtlMs(),   // 控制台据此显示「每 N 分钟自动刷新」
+    accounts,
+  };
+}
+
+// 同步选号（控制台探测/测试/校验等管理路径使用，不占用并发名额，避免管理操作被闸门卡住）
 function pickAccount() {
-  const list = enabledAccounts();
+  quotaPeek();   // 管理路径（探测/测试/校验）同样顺手续期额度快照
+  const list = accountList();
   if (!list.length) return { name: '默认', key: config.apiKey || '' };
+  if (config.accountMode === 'weighted') return weightedPick(list);
   if (config.accountMode === 'roundrobin' && list.length > 1) {
     const a = list[RR_COUNTER % list.length];
     RR_COUNTER = (RR_COUNTER + 1) % 1000000000;
     return a;
   }
-  const byIdx = config.accounts[config.activeAccount];
-  if (byIdx && byIdx.key && byIdx.enabled !== false) return byIdx;
+  const all = config.accounts || [];
+  const idx = clampInt(config.activeAccount, 0, Math.max(0, all.length - 1), 0);
+  const want = all[idx];
+  if (want && want.key && want.enabled !== false) {
+    const name = String(want.name || `账号${idx + 1}`);
+    const hit = list.find((a) => a.name === name);
+    if (hit) return hit;
+  }
   return list[0];
 }
 const chatHeaders = (key) => ({
@@ -412,8 +713,28 @@ async function fetchOfficialModels() {
   return { sources, found: valid.length, added, knownModels: config.knownModels, ...META.officialModelsFetch };
 }
 
+// META.models 以「任意 modelId」为键：只要有人拿随机模型名打代理就能无限撑大 metadata.json。
+// 兜底裁剪：超过 MODEL_META_MAX 条时按最后活动时间淘汰最旧的（knownModels 的条目永不淘汰）。
+const MODEL_META_MAX = 500;
+function metaActivity(m) {
+  return m?.lastUsed || m?.probedAt || m?.validatedAt || 0;
+}
+function pruneModelMeta() {
+  const keys = Object.keys(META.models);
+  if (keys.length <= MODEL_META_MAX) return;
+  const keep = new Set(config.knownModels || []);
+  const removable = keys.filter((k) => !keep.has(k)).sort((a, b) => metaActivity(META.models[a]) - metaActivity(META.models[b]));
+  let over = keys.length - MODEL_META_MAX;
+  for (const k of removable) {
+    if (over <= 0) break;
+    delete META.models[k];
+    over -= 1;
+  }
+}
+
 function record(modelId, info) {
-  META.models[modelId] = { ...(META.models[modelId] || {}), ...info };
+  META.models[modelId] = { ...(META.models[modelId] || {}), ...info, lastUsed: Date.now() };
+  pruneModelMeta();
   META.history.unshift({ ts: Date.now(), model: modelId, ...info });
   if (META.history.length > 100) META.history.length = 100;
   if (info.account) {
@@ -443,11 +764,13 @@ function readBody(req) {
   });
 }
 
-function unwrap(json) {
+function unwrap(json, httpStatus = 200) {
   const d = json?.data && json.data.choices ? json.data : json;
   if (d?.error && !d?.choices) {
     const msg = typeof d.error === 'string' ? d.error : JSON.stringify(d.error);
-    const status = /model not found/i.test(msg) ? 404 : 502;
+    // 上游 HTTP 状态要原样保留：网关限流时是 429，早期实现一律写 502，
+    // 导致客户端把「限流」误判成「上游错误」而看不到 Retry-After 语义。
+    const status = httpStatus !== 200 ? httpStatus : (/model not found/i.test(msg) ? 404 : 502);
     return { status, body: { error: { message: msg, type: 'upstream_error' } }, routing: {} };
   }
   const r = parseRouting(d);
@@ -528,18 +851,26 @@ function buildAttempts(modelId, cfg) {
 const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.stringify(e));
 
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
+// acc 由调用方传入（并发闸门已经取号，整条请求固定用同一个账号）；
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
+async function attemptOnce(modelId, body, attempt, acc, signal) {
   const send = injectPrefs(body, modelId, attempt);
-  const acc = pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
     });
-    const json = await res.json().catch(() => null);
-    if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
-    const { status, body: out, routing } = unwrap(json);
-    return { status, out, routing, netError: null, acc };
+    const httpStatus = res.status;
+    const text = await res.text().catch(() => '');
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* 上游限流常返回 HTML 错误页，按文本兜底 */ }
+    const retryAfter = res.headers.get('retry-after') || null;
+    if (!json) {
+      const msg = text.slice(0, 400) || `HTTP ${httpStatus}`;
+      // 关键：非 JSON 也保留真实 HTTP 状态（429 就是 429），不能一律 502
+      return { status: httpStatus, out: { error: { message: msg, type: 'upstream_error' } }, routing: {}, netError: httpStatus === 429 ? `HTTP 429` : null, acc, retryAfter };
+    }
+    const { status, body: out, routing } = unwrap(json, httpStatus);
+    return { status, out, routing, netError: null, acc, retryAfter };
   } catch (e) {
     return { status: 502, out: { error: { message: `upstream fetch failed: ${e.message}`, type: 'upstream_error' } }, routing: {}, netError: e.message, acc };
   }
@@ -549,7 +880,8 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
-async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+// account：并发闸门本次取到的账号（整条请求的所有尝试固定用它）；不传时退回同步选号（管理路径）
+async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000, account = null } = {}) {
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
   const t0 = Date.now();
@@ -567,7 +899,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       try {
         if (stream) {
           const send = injectPrefs(body, modelId, attempt);
-          const acc = pickAccount();
+          const acc = account || pickAccount();
           let up = null;
           let netError = null;
           try {
@@ -620,7 +952,15 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
-            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
+            // 原样保留上游 HTTP 状态（429 就是 429，不能被抹成 502），并标注限流便于上层退避重试
+            last = {
+              status: up.status,
+              out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } },
+              routing: parseRouting(json || {}),
+              acc,
+              netError: up.status === 429 ? 'HTTP 429' : null,
+              retryAfter: up.headers.get('retry-after') || null,
+            };
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
@@ -634,7 +974,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, body, attempt, account || pickAccount(), ctrl.signal);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
@@ -652,7 +992,23 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null };
 }
 
+const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+// 上游 429 判定：HTTP 状态或错误文本命中都算限流（网关限流时常常回 HTML 错误页，文本里带 429）
+function isRateLimited(chain) {
+  if (!chain) return false;
+  if (chain.status === 429) return true;
+  const msg = errText(chain.out?.error?.message ?? chain.out?.error);
+  return /(^|\D)429(\D|$)|too many requests|rate[-\s]?limit/i.test(msg);
+}
+// 指数退避 + 抖动：多路请求被同时限流时错开回撞时间
+function backoffDelayMs(round, base, max) {
+  if (base <= 0) return 0;
+  return Math.round(Math.min(max, base * 2 ** round) * (0.8 + Math.random() * 0.4));
+}
+
 async function handleChat(req, res) {
+  const t0req = Date.now();   // 整条请求的起点：耗时/排队/退避都要算进去，历史里才看得出真实等待
   const raw = await readBody(req);
   let body;
   try { body = JSON.parse(raw.toString('utf8')); } catch { return sendJSON(res, 400, { error: { message: 'invalid JSON body' } }); }
@@ -663,24 +1019,89 @@ async function handleChat(req, res) {
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  // 1) 取号：有空闲名额立即开工；并发满则排队等待（本地绝不产生 429），排队超时才回 503。
+  // 2) 上游真回 429：先归还名额（让排在后面的请求先跑，不空占并发）→ 退避 → 重新取号重试；
+  //    重试用尽仍是 429 才如实透传（附 Retry-After）。
+  const { retries, baseDelayMs, maxDelayMs, totalTimeoutMs } = retry429Plan();
+  const t0retry = Date.now();     // 429 重试预算的起点
+  let lastBackoffMs = 0;          // 最后一次退避的实际时长（用于给客户端一个诚实的 Retry-After）
+  let lease = null;
+  let chain = null;
+  let queueMs = 0;
+  let rateRetries = 0;
+  const allTrace = [];            // 逐轮累计：chain.trace 只含最后一轮，直接用会丢掉前几轮的尝试路径
+  for (let round = 0; ; round++) {
+    const q0 = Date.now();
+    try {
+      lease = await acquireSlot(req, res, queueTimeout());
+    } catch (e) {
+      if (e?.code === 'CLIENT_CLOSED') { try { res.destroy(); } catch {} return; }
+      const type = e?.code === 'QUEUE_TIMEOUT' ? 'queue_timeout' : e?.code === 'BUSY' ? 'pool_busy' : 'no_account';
+      return sendJSON(res, 503, { error: { message: `本地账号并发闸门：${e.message}`, type } });
+    }
+    queueMs += Date.now() - q0;
+    // 取到号之后客户端可能已经走了（排队期间断开，或 429 退避等待期间断开）：
+    // 归还名额直接收工，别替一个已经离开的客户端去打上游、白烧额度。
+    if (res.destroyed || req.socket?.destroyed) {
+      releaseSlot(lease); lease = null;
+      try { res.destroy(); } catch {}
+      return;
+    }
+    // 每次尝试的超时也要受总预算约束：剩余预算不足时不再给满 120s，避免一条请求拖到分钟级
+    const budgetLeft = Math.max(5000, totalTimeoutMs - (Date.now() - t0retry));
+    try {
+      chain = await runChatChain(req, body, modelId, cfg, {
+        stream: isStream, account: lease, attemptTimeoutMs: Math.min(120000, budgetLeft),
+      });
+    } catch (e) {
+      releaseSlot(lease); lease = null;
+      return sendJSON(res, 502, { error: { message: `proxy error: ${e.message}`, type: 'proxy_error' } });
+    }
+    if (chain.trace) allTrace.push(...chain.trace.map((t) => ({ ...t, round })));
+    if (!isRateLimited(chain) || round >= retries) break;
+    rateRetries += 1;
+    const wait = backoffDelayMs(round, baseDelayMs, maxDelayMs);
+    // 预算不够再等一轮就放弃重试，把最后一次的 429 如实返回（附上游/本次退避的 Retry-After）
+    if (Date.now() - t0retry + wait > totalTimeoutMs) {
+      console.warn(`[限流退避] ${modelId} 429 重试预算 ${totalTimeoutMs}ms 用尽，停止重试并透传 429`);
+      break;
+    }
+    lastBackoffMs = wait;
+    releaseSlot(lease); lease = null;
+    console.warn(`[限流退避] ${modelId} 上游 429，第 ${rateRetries}/${retries} 次重试将于 ${wait}ms 后发起`);
+    await sleep(wait);
+  }
+  const acc = chain.acc || lease;
+  const accountLoad = () => headerSafe(`${activeOf(lease.name)}/${lease.concurrency}`);
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
     const up = chain.streamUp;
-    const acc = chain.acc;
-    const t0 = chain.t0;
     const ctype = up.headers.get('content-type') || 'text/event-stream';
-    res.writeHead(up.status, {
-      'Content-Type': ctype,
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-      'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
-      'X-Cline-Attempts': String(chain.trace.length),
-      'X-Cline-Account': headerSafe(acc.name),
-    });
-    if (chain.streamHead) res.write(chain.streamHead);
+    // 并发名额必须持有到流结束：上游连接还开着，这条请求仍在占用该账号的并发额度
+    let released = false;
+    const releaseOnce = () => { if (!released) { released = true; releaseSlot(lease); } };
+    try {
+      res.writeHead(up.status, {
+        'Content-Type': ctype,
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
+        'X-Cline-Attempts': String(allTrace.length),
+        'X-Cline-Account': headerSafe(acc.name),
+        'X-Cline-Account-Load': accountLoad(),
+        'X-Cline-Queue-Ms': String(queueMs),
+        'X-Cline-RateLimit-Retries': String(rateRetries),
+      });
+      if (chain.streamHead) res.write(chain.streamHead);
+    } catch (e) {
+      // 客户端在建流前就断开：不抛出去（否则名额可能泄漏），顺手把上游 body 收掉
+      releaseOnce();
+      try { up.body?.cancel?.(); } catch {}
+      try { res.destroy(); } catch {}
+      return;
+    }
     const buf = [];
     const tap = new Transform({
       transform(c, enc, cb) { buf.push(c); cb(null, c); },
@@ -704,7 +1125,12 @@ async function handleChat(req, res) {
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
+        record(modelId, {
+          provider, canonical, ms: Date.now() - t0req, stream: true, error: null, account: acc.name,
+          attempts: allTrace.map((t) => t.upstream || 'auto'),
+          traceAll: allTrace,
+          queuedMs: queueMs, rateRetries,
+        });
         cb();
       },
     });
@@ -714,52 +1140,83 @@ async function handleChat(req, res) {
     const src = Readable.fromWeb(up.body);
     src.on('error', (e) => {
       record(modelId, {
-        provider: null, canonical: null, ms: Date.now() - t0, stream: true,
+        provider: null, canonical: null, ms: Date.now() - t0req, stream: true,
         error: `stream aborted: ${e.message}`, account: acc.name,
-        attempts: chain.trace.map((t) => t.upstream || 'auto'),
+        attempts: allTrace.map((t) => t.upstream || 'auto'),
+        traceAll: allTrace,
+        queuedMs: queueMs, rateRetries,
       });
+      releaseOnce();
       try { res.destroy(); } catch {}
     });
     // 下游（客户端）中断会让 res 抛 error / close，一并把上游 body 收掉，避免悬挂连接
+    // finish = 流正常推完；close = 客户端提前断开。两条路径都要归还并发名额（releaseOnce 幂等）。
+    res.on('finish', releaseOnce);
     res.on('error', () => { try { src.destroy(); } catch {} });
-    res.on('close', () => { try { src.destroy(); } catch {} });
+    res.on('close', () => { try { src.destroy(); } catch {} releaseOnce(); });
     src.pipe(tap).pipe(res);
     return;
   }
 
-  const { status, out, routing, acc } = chain;
-  if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
-  // 客户端实际使用成功的新订阅模型自动收录进列表
-  if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
-    config.knownModels.push(modelId);
-    saveConfig();
+  const { status, out, routing } = chain;
+  // try/finally 是并发闸门的硬要求：无论写响应是否成功（客户端可能已断开导致抛错），
+  // 名额都必须归还，否则一条异常请求就能把该账号的并发永久占死。
+  try {
+    if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+    // 客户端实际使用成功的新订阅模型自动收录进列表
+    if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
+      config.knownModels.push(modelId);
+      saveConfig();
+    }
+    record(modelId, {
+      provider: routing.finalProvider || null,
+      canonical: routing.canonicalSlug || null,
+      ms: Date.now() - t0req,   // 含排队 + 429 退避的真实总耗时
+      stream: false,
+      attempts: allTrace.map((t) => t.upstream || 'auto'),
+      trace: allTrace,
+      error: status !== 200 ? out?.error?.message || null : null,
+      account: acc ? acc.name : null,
+      queuedMs: queueMs,
+      rateRetries,
+    });
+    const headers = {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
+      'X-Cline-Actual-Upstream': routing.finalProvider || 'unknown',
+      'X-Cline-Canonical-Model': routing.canonicalSlug || '',
+      'X-Cline-Attempts': String(allTrace.length),
+      'X-Cline-Account': headerSafe(acc ? acc.name : ''),
+      'X-Cline-Account-Load': accountLoad(),
+      'X-Cline-Queue-Ms': String(queueMs),
+      'X-Cline-RateLimit-Retries': String(rateRetries),
+    };
+    // 本地闸门不会产生 429；走到这里的 429 只可能是上游真的限流，如实透传并给出 Retry-After。
+    // 优先用上游自己给的值；没有就用本次真实退避量，而不是配置上限 maxDelayMs（那会明显偏大）。
+    const ra = chain.retryAfter || (lastBackoffMs ? Math.ceil(lastBackoffMs / 1000) : 1);
+    if (status === 429) headers['Retry-After'] = String(Math.max(1, Math.min(600, Number(ra) || 1)));
+    res.writeHead(status, headers);
+    res.end(JSON.stringify(out));
+  } finally {
+    releaseSlot(lease);
   }
-  record(modelId, {
-    provider: routing.finalProvider || null,
-    canonical: routing.canonicalSlug || null,
-    ms: Date.now() - chain.t0,
-    stream: false,
-    attempts: chain.trace.map((t) => t.upstream || 'auto'),
-    trace: chain.trace,
-    error: status !== 200 ? out?.error?.message || null : null,
-    account: acc ? acc.name : null,
-  });
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
-    'X-Cline-Actual-Upstream': routing.finalProvider || 'unknown',
-    'X-Cline-Canonical-Model': routing.canonicalSlug || '',
-    'X-Cline-Attempts': String(chain.trace.length),
-    'X-Cline-Account': headerSafe(acc ? acc.name : ''),
-  });
-  res.end(JSON.stringify(out));
 }
 
 // ---------- HTTP 服务 ----------
+// no-store 是必须的：/api/runtime 这类轮询接口如果被浏览器按启发式缓存下来，
+// 控制台会一直显示同一份旧数据（实测 Chrome 会缓存没有 Cache-Control 的 GET）。
+// 另外整体 try 住：客户端可能已经断开，往死 socket 写会抛错，代理不该为这个报 500 或产生未处理拒绝。
 function sendJSON(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
-  res.end(JSON.stringify(obj));
+  try {
+    if (res.writableEnded || res.destroyed) return;
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify(obj));
+  } catch { /* 客户端已断开：忽略 */ }
 }
 
 async function catalog() {
@@ -777,7 +1234,6 @@ async function catalog() {
 // 这两条都是纯账单查询：不触发推理、不消耗额度、不计费（与「探测/测试/校验」完全不同）。
 // 金额单位：costUsd 与阈值同为 1e-8 美元（对 /usages 明细做最小二乘拟合验证：
 // 未缓存输入 $0.15/M、缓存 $0.003/M、输出 $0.60/M，比例符合标准价目形态）。
-const QUOTA_TTL_MS = 60e3;
 const MU_PER_USD = 1e8;
 const QUOTA_WINDOWS = [
   ['five_hour', '5小时', 'last5HoursUsageCostUSDPerUser'],
@@ -822,22 +1278,49 @@ async function fetchAccountQuota(key) {
   };
 }
 
-// 逐账号按 key 查自己的额度（/users/me/* 是「key 所属账号」，多账号必须逐把查），带 TTL 缓存
-let quotaCache = { at: 0, accounts: [] };
-async function quotaSnapshot({ force = false } = {}) {
-  if (!force && quotaCache.accounts.length && Date.now() - quotaCache.at < QUOTA_TTL_MS) return quotaCache;
-  const list = config.accounts || [];
-  const accounts = await Promise.all(list.map(async (a, i) => {
-    const name = a?.name || `账号${i + 1}`;
-    const enabled = a?.enabled !== false;
-    if (!a?.key) return { name, enabled, ok: false, error: '未配置 key' };
-    try {
-      return { name, enabled, ...(await fetchAccountQuota(a.key)) };
-    } catch (e) {
-      return { name, enabled, ok: false, error: String(e?.message || e).slice(0, 200) };
-    }
-  }));
-  quotaCache = { at: Date.now(), accounts };
+// 逐账号按 key 查自己的额度（/users/me/* 是「key 所属账号」，多账号必须逐把查），带 TTL 缓存。
+// 缓存同时供两处使用：
+//   - 控制台额度表与加权选号：TTL 都取 quotaRefreshMs（默认 15 分钟），见 quotaTtlMs()
+//   - 「↻ 刷新额度」按钮走 GET /api/quota?refresh=1 强制立刻重拉，不受 TTL 限制
+//   - 加权选号：只读缓存、绝不在请求路径上打网络；过期时后台补一次（见 quotaPeek）
+// inflight 用来合并并发触发的重复抓取，避免同一时刻把账单接口打爆。
+const quotaCache = { at: 0, accounts: [], inflight: null };
+// 额度快照的有效期：统一由 quotaRefreshMs 决定（默认 15 分钟）。
+// 控制台额度表、加权选号、/api/quota 三处共用同一个 TTL —— 额度是账单接口，
+// 没必要时时刻刻去拉；要立刻看最新的就点控制台的「↻ 刷新额度」（走 ?refresh=1 强制）。
+function quotaTtlMs() {
+  return clampInt(config.quotaRefreshMs, 0, 24 * 3600e3, 900000);
+}
+async function quotaSnapshot({ force = false, ttlMs = quotaTtlMs() } = {}) {
+  if (!force && quotaCache.accounts.length && Date.now() - quotaCache.at < ttlMs) return quotaCache;
+  if (quotaCache.inflight) return quotaCache.inflight;
+  const p = (async () => {
+    const list = config.accounts || [];
+    const accounts = await Promise.all(list.map(async (a, i) => {
+      const name = a?.name || `账号${i + 1}`;
+      const enabled = a?.enabled !== false;
+      if (!a?.key) return { name, enabled, ok: false, error: '未配置 key' };
+      try {
+        return { name, enabled, ...(await fetchAccountQuota(a.key)) };
+      } catch (e) {
+        return { name, enabled, ok: false, error: String(e?.message || e).slice(0, 200) };
+      }
+    }));
+    quotaCache.at = Date.now();
+    quotaCache.accounts = accounts;
+    quotaCache.inflight = null;
+    return quotaCache;
+  })().catch((e) => { quotaCache.inflight = null; throw e; });
+  quotaCache.inflight = p;
+  return p;
+}
+
+// 选号取额度：只读缓存。缓存超过 quotaRefreshMs 就丢一个后台刷新（不 await，不阻塞本次请求）
+function quotaPeek() {
+  const stale = !quotaCache.accounts.length || Date.now() - quotaCache.at >= quotaTtlMs();
+  if (stale && !quotaCache.inflight && (config.accounts || []).some((a) => a && a.key)) {
+    quotaSnapshot({ force: true }).catch(() => { /* 账单接口抖动不影响代理 */ });
+  }
   return quotaCache;
 }
 
@@ -860,7 +1343,8 @@ const server = http.createServer(async (req, res) => {
       if (!authOK(req)) return unauthorized(res);
     }
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // 控制台页面同样不缓存：升级代理代码后，刷新就能拿到新界面，不用清浏览器缓存
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(fs.readFileSync(path.join(PUBLIC_DIR, 'index.html')));
     }
     if (req.method === 'GET' && p === '/api/models') {
@@ -908,30 +1392,68 @@ const server = http.createServer(async (req, res) => {
         mode: config.accountMode,
         active: config.activeAccount,
         stats: META.stats || {},
+        tuning: {
+          accountConcurrency: clampInt(config.accountConcurrency, 1, 1000, 5),
+          poolConcurrency: clampInt(config.poolConcurrency, 0, 10000, 0),
+          queueTimeoutMs: queueTimeout(),
+          retry429: retry429Plan().retries,
+        },
+        runtime: poolSnapshot(),
       });
     }
+    // 轻量运行态：控制台轮询用（不含密钥，只报并发占用与各账号当前有效权重）
+    if (req.method === 'GET' && p === '/api/runtime') {
+      return sendJSON(res, 200, poolSnapshot());
+    }
     if (req.method === 'GET' && p === '/api/quota') {
-      // refresh=1 跳过缓存（页面上的「刷新额度」按钮走这条）
-      const snap = await quotaSnapshot({ force: url.searchParams.get('refresh') === '1' });
-      return sendJSON(res, 200, { fetchedAt: snap.at, accounts: snap.accounts });
+      // 默认走 15 分钟 TTL 缓存；refresh=1（页面上的「↻ 刷新额度」）强制立刻重拉
+      const force = url.searchParams.get('refresh') === '1';
+      const snap = await quotaSnapshot({ force });
+      return sendJSON(res, 200, { fetchedAt: snap.at, accounts: snap.accounts, ttlMs: quotaTtlMs(), forced: force });
     }
     if (req.method === 'POST' && p === '/api/accounts') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
+      const defConc = clampInt(body?.tuning?.accountConcurrency, 1, 1000, clampInt(config.accountConcurrency, 1, 1000, 5));
+      // 账号名是并发计数、统计、额度对齐的共同键：重名会让两个账号共用同一份计数，必须在入口去重。
+      // 用「已占用集合 + 循环找空位」而不是简单计数，避免生成的名字又撞上已存在的名字。
+      const taken = new Set();   // 只记录「本次结果里已经用掉的名字」，不能拿输入去种，否则每个账号都会被改名
+      const uniqName = (n) => {
+        if (!taken.has(n)) { taken.add(n); return n; }
+        for (let k = 2; ; k++) {
+          const cand = `${n} (${k})`;
+          if (!taken.has(cand)) { taken.add(cand); return cand; }
+        }
+      };
       const accs = (Array.isArray(body.accounts) ? body.accounts : [])
         .map((a, i) => ({
-          name: String(a.name || `账号${i + 1}`).slice(0, 50),
+          name: uniqName(String(a.name || `账号${i + 1}`).slice(0, 50)),
           key: String(a.key || '').trim(),
           enabled: a.enabled !== false,
+          // 并发与权重必须原样保留：旧版保存逻辑只留 name/key/enabled，会把这两个新增字段抹掉
+          concurrency: clampInt(a.concurrency, 1, 1000, defConc),
+          weight: Math.round(clampNum(a.weight, 0, 100, 1) * 100) / 100,
         }))
         .filter((a) => a.key);
       if (!accs.length) return sendJSON(res, 400, { error: { message: '至少需要一个有效账号（key 非空）' } });
       config.accounts = accs;
-      config.accountMode = body.mode === 'roundrobin' ? 'roundrobin' : 'single';
+      config.accountMode = ACCOUNT_MODES.has(body.mode) ? body.mode : 'single';
       config.activeAccount = Math.min(Math.max(0, Number(body.active) || 0), accs.length - 1);
+      // 闸门调优参数（默认并发 / 池总并发 / 排队超时 / 429 重试次数）
+      const t = body.tuning || {};
+      if (t.accountConcurrency !== undefined) config.accountConcurrency = defConc;
+      if (t.poolConcurrency !== undefined) config.poolConcurrency = clampInt(t.poolConcurrency, 0, 10000, config.poolConcurrency);
+      if (t.queueTimeoutMs !== undefined) config.queueTimeoutMs = clampInt(t.queueTimeoutMs, 0, 3600e3, config.queueTimeoutMs);
+      if (t.retry429 !== undefined) config.retry429 = { ...(config.retry429 || {}), retries: clampInt(t.retry429, 0, 10, retry429Plan().retries) };
       saveConfig();
       RR_COUNTER = 0;
-      quotaCache = { at: 0, accounts: [] };   // 账号池变了，额度缓存作废（否则会串号）
-      return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount });
+      quotaCache.at = 0; quotaCache.accounts = [];   // 账号池变了，额度缓存作废（否则会串号）
+      // 后台立刻按新账号池重拉一次额度：加权选号和 /api/runtime 的权重都要用它，
+      // 不 await，避免保存动作被账单接口的耗时拖住
+      quotaSnapshot({ force: true }).catch(() => { /* 账单接口抖动不影响保存 */ });
+      // 已删除账号的并发计数要清掉，避免残留计数把新账号的名额算错
+      const names = new Set(config.accounts.map((a) => a.name));
+      for (const n of [...pool.active.keys()]) if (!names.has(n)) pool.active.delete(n);
+      return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount, tuning: { accountConcurrency: config.accountConcurrency, poolConcurrency: config.poolConcurrency, queueTimeoutMs: queueTimeout(), retry429: retry429Plan().retries } });
     }
     if (req.method === 'POST' && p === '/api/accounts/test') {
       const { key } = JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -1029,9 +1551,17 @@ const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 server.listen(config.port, BIND_HOST, () => {
   console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
   console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
+  const tun = poolSnapshot();
+  console.log(`账号模式: ${config.accountMode} · 池并发上限: ${tun.limit || '不限'} · 单账号默认并发: ${clampInt(config.accountConcurrency, 1, 1000, 5)} · 排队上限: ${queueTimeout()}ms`);
+  // 预热额度快照：加权选号依赖它，先拉一次，避免头几条请求都用「额度未知」的中性权重
+  if (enabledAccounts().length) quotaSnapshot({ force: true }).catch(() => {});
 });
 
 // 进程级兜底：代理是常驻服务，任何未捕获异常/未处理拒绝只记录日志，不退出进程。
 // 历史故障：单条流式请求的上游 body 中断触发 unhandled 'error'，把整个代理带走。
+// 元数据是合并写盘的（最多 1 秒一次），收到退出信号时补一次 flush，避免丢最后一段历史
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { flushMeta(); process.exit(0); });
+}
 process.on('uncaughtException', (e) => console.error('[未捕获异常]', e));
 process.on('unhandledRejection', (e) => console.error('[未处理拒绝]', e));
