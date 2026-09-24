@@ -101,6 +101,7 @@ location / {
 | `knownModels` | 订阅模型清单（控制台主表） |
 | `perModel` | 每模型的钉住配置：`{ upstream, pinMode: strict|preferred, sort: cost|ttft|tps, maxRetries }` |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
+| `useClineOAuth` | `true` 时忽略账号池里的静态 `sk_`，改读本机 `~/.cline/data/settings/providers.json` 的 Cline 登录态。Access token 在过期前 5 分钟自动调用 `/auth/refresh` 续期并写回。静态 key 被网关拒绝并返回 `Unauthorized: Please make sure you're using the latest version of Cline and re-authenticate your Cline account` 时打开此项。可用环境变量 `CLINE_PROVIDERS_PATH` 指向另一份 providers.json |
 
 ---
 

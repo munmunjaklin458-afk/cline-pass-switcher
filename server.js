@@ -23,6 +23,9 @@ const DEFAULT_CONFIG = {
   proxyKey: '',
   publicBaseUrl: '',
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
+  // true 时上游不使用 accounts[].key，改为读取本机 Cline CLI 登录态并自动续期。
+  // 静态 sk_ 被网关拒绝（Unauthorized: re-authenticate）时打开此项。
+  useClineOAuth: false,
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
   accountMode: 'single',   // single=手动指定 | roundrobin=轮询
@@ -120,10 +123,117 @@ function pickAccount() {
   if (byIdx && byIdx.key && byIdx.enabled !== false) return byIdx;
   return list[0];
 }
-const chatHeaders = (key) => ({
-  'Content-Type': 'application/json',
-  Authorization: `Bearer ${key}`,
-});
+
+// Cline CLI 把可刷新的登录态存在 ~/.cline/data/settings/providers.json。
+// 静态 sk_ key 被网关拒绝时，用这份登录态换 access token，并在过期前自动续期。
+const CLINE_PROVIDERS_PATH = process.env.CLINE_PROVIDERS_PATH
+  || path.join(process.env.HOME || '/root', '.cline/data/settings/providers.json');
+const OAUTH_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+let oauthCache = null; // { token, expiresAt, refreshToken }
+let oauthRefreshPromise = null;
+
+function readClineAuth() {
+  const providers = loadJson(CLINE_PROVIDERS_PATH, null);
+  const map = providers?.providers || {};
+  return map.cline?.settings?.auth || map['cline-pass']?.settings?.auth || null;
+}
+
+function jwtExpiryMs(token) {
+  const raw = String(token || '').replace(/^workos:/i, '');
+  const part = raw.split('.')[1];
+  if (!part) return 0;
+  try {
+    const payload = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function refreshClineOAuth(refreshToken) {
+  const res = await fetch(`${config.upstreamBase}/auth/refresh`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Cline/3.0.64',
+      'HTTP-Referer': 'https://cline.bot',
+      'X-Title': 'Cline',
+    },
+    body: JSON.stringify({ refreshToken, grantType: 'refresh_token' }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const json = await res.json().catch(() => null);
+  const data = json?.data || json || {};
+  if (!res.ok || !data.accessToken) {
+    const msg = data?.message || json?.error?.message || `oauth refresh failed (${res.status})`;
+    throw new Error(msg);
+  }
+  const token = String(data.accessToken).replace(/^workos:/i, '');
+  return {
+    token,
+    refreshToken: data.refreshToken || refreshToken,
+    expiresAt: Date.parse(data.expiresAt) || jwtExpiryMs(token),
+  };
+}
+
+function persistClineAuth(next) {
+  try {
+    const providers = loadJson(CLINE_PROVIDERS_PATH, null);
+    if (!providers?.providers) return;
+    const now = new Date().toISOString();
+    for (const id of ['cline', 'cline-pass']) {
+      const auth = providers.providers[id]?.settings?.auth;
+      if (!auth) continue;
+      auth.accessToken = `workos:${next.token}`;
+      auth.refreshToken = next.refreshToken;
+      auth.expiresAt = next.expiresAt;
+      providers.providers[id].updatedAt = now;
+    }
+    fs.writeFileSync(CLINE_PROVIDERS_PATH, JSON.stringify(providers, null, 2) + '\n', { mode: 0o600 });
+  } catch (e) {
+    console.warn('[oauth] 写回登录态失败:', e.message);
+  }
+}
+
+async function clineBearer() {
+  if (oauthCache && oauthCache.expiresAt - Date.now() > OAUTH_REFRESH_BUFFER_MS) return oauthCache.token;
+  if (!oauthRefreshPromise) {
+    oauthRefreshPromise = (async () => {
+      const auth = readClineAuth();
+      const stored = String(auth?.accessToken || '').replace(/^workos:/i, '');
+      const expiresAt = Number(auth?.expiresAt) || jwtExpiryMs(stored);
+      if (stored && expiresAt - Date.now() > OAUTH_REFRESH_BUFFER_MS) {
+        oauthCache = { token: stored, expiresAt, refreshToken: auth.refreshToken };
+        return stored;
+      }
+      if (!auth?.refreshToken) throw new Error('Cline 登录态缺失，无法续期');
+      const next = await refreshClineOAuth(auth.refreshToken);
+      oauthCache = next;
+      persistClineAuth(next);
+      return next.token;
+    })().finally(() => { oauthRefreshPromise = null; });
+  }
+  return oauthRefreshPromise;
+}
+
+async function chatHeaders(key, { oauth = !!config.useClineOAuth } = {}) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Cline/3.0.64',
+    'HTTP-Referer': 'https://cline.bot',
+    'X-Title': 'Cline',
+    'X-CLIENT-TYPE': 'cline-cli',
+    'X-CLIENT-VERSION': '3.0.64',
+    'X-PLATFORM': 'cli',
+    'X-PLATFORM-VERSION': '3.0.64',
+  };
+  if (oauth) {
+    headers.Authorization = `Bearer workos:${await clineBearer()}`;
+    return headers;
+  }
+  headers.Authorization = `Bearer ${key}`;
+  return headers;
+}
 
 // 代理密钥：非空时，/v1/* 与 /api/* 均需鉴权（Authorization: Bearer <key> 或 X-Admin-Key: <key>）；
 // 控制台页面本身保持开放（不含任何敏感数据，数据由带鉴权的 /api/* 提供）。
@@ -226,7 +336,7 @@ async function harvestAvailableProviders(modelId, pipeline) {
   const body = pipeline === 'planner'
     ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
     : { ...base, provider: { only: ['__probe__'] } };
-  const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
+  const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: await chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
   const err = json?.error;
   if (typeof err !== 'string') return null;
   if (pipeline === 'planner') {
@@ -254,7 +364,7 @@ async function probeModel(modelId) {
   const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
     method: 'POST',
-    headers: chatHeaders(acc.key),
+    headers: await chatHeaders(acc.key),
     body: JSON.stringify(body),
   }, 180000);
   const ms = Date.now() - t0;
@@ -347,7 +457,7 @@ async function validateUpstreams(modelId) {
         ? { ...base, providerOptions: { gateway: { only: [slug] } } }
         : { ...base, provider: { only: [slug] } };
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
-        method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
+        method: 'POST', headers: await chatHeaders(acc.key), body: JSON.stringify(body),
       }, 60000).catch(() => ({ json: { error: 'network error' } }));
       let status = 'unknown';
       let note = '';
@@ -534,7 +644,7 @@ async function attemptOnce(modelId, body, attempt, signal) {
   const acc = pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
-      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
+      method: 'POST', headers: await chatHeaders(acc.key), body: JSON.stringify(send), signal,
     });
     const json = await res.json().catch(() => null);
     if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
@@ -571,7 +681,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           let up = null;
           let netError = null;
           try {
-            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
+            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: await chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
           } catch (e) { netError = e.message; }
           const ctype = up?.headers?.get('content-type') || '';
           let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
@@ -749,7 +859,7 @@ function sendJSON(res, status, obj) {
 
 async function catalog() {
   if (META.catalog && Date.now() - (META.catalogFetchedAt || 0) < 3600e3) return META.catalog;
-  const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: chatHeaders(pickAccount().key) });
+  const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: await chatHeaders(pickAccount().key) });
   const ids = (json?.data || []).map((m) => m.id);
   if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
   return META.catalog || [];
@@ -849,7 +959,7 @@ const server = http.createServer(async (req, res) => {
       const model = config.knownModels[0] || 'cline-pass/glm-5.3-flash';
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
         method: 'POST',
-        headers: chatHeaders(k),
+        headers: await chatHeaders(k, { oauth: false }),
         body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 512 }),
       }, 120000);
       if (json?.error && !json?.data) {

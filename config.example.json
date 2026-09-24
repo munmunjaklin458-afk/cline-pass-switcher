@@ -4,6 +4,7 @@
   "proxyKey": "",
   "publicBaseUrl": "",
   "exposeCatalog": false,
+  "useClineOAuth": false,
   "upstreamBase": "https://api.cline.bot/api/v1",
   "accounts": [],
   "accountMode": "single",
