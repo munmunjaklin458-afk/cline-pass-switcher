@@ -12,6 +12,9 @@ services:
     restart: unless-stopped
     environment:
       - DATA_DIR=/data
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - PROXY_KEY=${PROXY_KEY:-}
       - BIND_HOST=0.0.0.0
     volumes:
       - ../data:/data

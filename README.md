@@ -24,11 +24,11 @@
 ```bash
 git clone https://github.com/<你的用户名>/cline-pass-switcher.git
 cd cline-pass-switcher
-node server.js        # 仅需 Node ≥ 18，无需 npm install
+ADMIN_PASSWORD='请换成你自己的强密码' node server.js  # Node ≥ 18，无需 npm install
 ```
 
 打开 <http://127.0.0.1:3123/>，在「账号管理」里添加你的 Cline Pass 账号（`sk_` 开头的 key）并保存即可。
-没有 key 也能启动：页面会提示配置入口。
+没有上游 key 也能启动，但首次启动必须设置 `ADMIN_PASSWORD` 或非空 `proxyKey`；先使用初始化密码登录，再添加上游账号。
 
 > Cline Pass key 从哪里来？购买 Cline Pass 订阅后，在 Cline 的账户设置里创建 API Key。
 > 订阅模型 ID 均为 `cline-pass/*` 前缀（如 `cline-pass/glm-5.2`）。
@@ -50,6 +50,9 @@ Model:    cline-pass/glm-5.2 等
 ```bash
 mkdir -p data && cp config.example.json data/config.json
 # 编辑 data/config.json，或在启动时用环境变量注入 key
+export ADMIN_PASSWORD='请换成你自己的强密码'
+export PUBLIC_BASE_URL=https://pass.example.com # 必须与浏览器访问的 Origin 一致（IP 部署同理）
+export PROXY_KEY='请换成独立的客户端密钥'
 
 # 有域名（A 记录指向服务器，自动签发 Let's Encrypt 受信证书）：
 CPASS_DOMAIN=pass.example.com docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
@@ -81,7 +84,8 @@ location / {
 |---|---|
 | `CLINE_PASS_KEY` | 上游 Cline Pass API Key（无 config 时自动创建账号） |
 | `PROXY_KEY` | 下游代理密钥（客户端访问代理的凭据） |
-| `PUBLIC_BASE_URL` | 门户展示的公网代理地址，如 `https://pass.example.com` |
+| `ADMIN_PASSWORD` | 仅首次初始化后台密码；已有密码哈希时不覆盖，后续在控制台修改 |
+| `PUBLIC_BASE_URL` | 公网地址及后台 Origin 校验基准，如 `https://pass.example.com`；HTTPS 反代必须配置 |
 | `PORT` / `BIND_HOST` / `DATA_DIR` | 端口 / 绑定地址（容器内为 0.0.0.0）/ 配置目录 |
 
 环境变量在启动时覆盖 `config.json`；此后通过控制台保存设置，会以当前生效值写回文件。
@@ -96,13 +100,40 @@ location / {
 | `accountMode` | `single` 手动指定 / `roundrobin` 轮询 |
 | `activeAccount` | 单账号模式下使用的下标 |
 | `proxyKey` | 下游代理密钥；空 = 不鉴权 |
-| `publicBaseUrl` | 公网代理地址（控制台展示用） |
+| `publicBaseUrl` | 公网代理地址，也是后台 Origin 校验和 Secure Cookie 的依据 |
+| `adminPasswordHash` | 自动生成的后台密码哈希，请勿手工填写或公开 |
+| `selectedCatalogModels` | 从目录手动加入的模型 ID |
+| `removedModels` | 从模型列表移除的 ID；保留在目录，官方拉取不会自动恢复 |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
 | `knownModels` | 订阅模型清单（控制台主表） |
 | `perModel` | 每模型的钉住配置：`{ upstream, pinMode: strict|preferred, sort: cost|ttft|tps, maxRetries }` |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
 
 ---
+
+## 后台登录与升级注意事项
+
+- 控制台按订阅模型、账号管理、请求测试、请求历史、模型目录、访问与安全分栏，支持手机抽屉导航。
+- 后台改用 HttpOnly、SameSite=Strict 会话 Cookie；HTTPS 公网地址启用 Secure。密码使用加盐 scrypt 哈希，不再将登录凭据存入 localStorage。
+- **兼容性变化：**后台 `/api/*` 不再接受代理 Bearer key，也不再支持匿名后台。首次启动用 `ADMIN_PASSWORD`，未设置时迁移已有 `proxyKey`；两者均空则拒绝启动。后台自动化调用需要先登录获取 Cookie，写入请求必须携带正确 Origin。
+- 客户端 `/v1/*`、模型和聊天别名仍使用代理密钥；修改后台密码不更改客户端密钥。后台密码修改会注销所有会话，重启也需要重新登录。
+- 反向代理部署必须配置 `PUBLIC_BASE_URL` 为浏览器实际访问地址。
+- 模型可从订阅列表移除并从目录恢复；移除不删除路由设置和历史，不是 API 调用黑名单。开启全部目录暴露后，客户端仍能看到这些目录模型。
+- 官方拉取结果可手动关闭，完成后 6 秒自动收起。
+
+### 回归测试
+
+```bash
+python3 test-auth.py
+node test-model-refresh.cjs
+# 可选浏览器测试（仅开发依赖，运行服务仍是零依赖）
+python3 -m venv .venv
+.venv/bin/pip install playwright
+.venv/bin/playwright install chromium
+.venv/bin/python check-ui.py
+```
+
+测试使用临时数据目录，不修改实际配置。可通过 `NODE=/path/to/node` 选择 Node。浏览器测试覆盖 1440/390/320px；官方拉取来源及结果使用 fixture，不代表联网验证上游。可选 `SCREENSHOT_DIR` 保存截图。
 
 ## 核心机制：Cline Pass 的两条路由管道（实测发现）
 

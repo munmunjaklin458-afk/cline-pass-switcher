@@ -8,6 +8,13 @@ _testenv/
 node_modules/
 dist/
 
+# 本机运行时、备份和测试产物
+runtime/
+backups/
+__pycache__/
+.venv/
+LOCAL-CHANGES.md
+
 # 系统文件
 .DS_Store
 Thumbs.db
