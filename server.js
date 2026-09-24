@@ -6,6 +6,7 @@
 //   由其规划器在系统凭证上游中自行挑选，响应元数据可回读实际上游。
 // - 目录模型 :free 变体：provider.only 真正透传到 OpenRouter，可精确钉住。
 import http from 'node:http';
+import { createAdminAuth } from './admin-auth.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
@@ -22,6 +23,7 @@ const DEFAULT_CONFIG = {
   apiKey: '',
   proxyKey: '',
   publicBaseUrl: '',
+  selectedCatalogModels: [],
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
@@ -60,8 +62,18 @@ function loadJson(file, fallback) {
   }
 }
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
+// Preserve previously exposed custom models on first upgrade.
+if (!Object.hasOwn(loadJson(CONFIG_PATH, {}), 'selectedCatalogModels')) {
+  config.selectedCatalogModels = Object.keys(config.perModel || {}).filter(id => !config.knownModels.includes(id));
+}
+config.removedModels = Array.isArray(config.removedModels) ? config.removedModels : [];
+const activeModelIds = () => [...new Set([...config.knownModels, ...config.selectedCatalogModels])].filter(id => !config.removedModels.includes(id));
+const modelCatalog = async () => [...new Set([...(await catalog()), ...config.knownModels, ...config.selectedCatalogModels, ...config.removedModels])];
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
-const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+const saveConfig = () => {
+  fs.writeFileSync(`${CONFIG_PATH}.tmp`, JSON.stringify(config, null, 2), { mode: 0o600 });
+  fs.renameSync(`${CONFIG_PATH}.tmp`, CONFIG_PATH);
+};
 const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
@@ -95,6 +107,8 @@ if (process.env.CLINE_PASS_KEY) {
 if (process.env.PROXY_KEY && process.env.PROXY_KEY.trim()) config.proxyKey = process.env.PROXY_KEY.trim();
 if (process.env.PUBLIC_BASE_URL) config.publicBaseUrl = process.env.PUBLIC_BASE_URL.trim();
 if (process.env.PORT) config.port = Number(process.env.PORT) || config.port;
+
+const adminAuth = await createAdminAuth(config, saveConfig);
 
 function isConfigured() {
   return !!config.apiKey || enabledAccounts().length > 0;
@@ -402,14 +416,14 @@ async function fetchOfficialModels() {
     if (ids.length) { ids.forEach((id) => found.add(id.toLowerCase())); sources.push('docs.cline.bot'); }
   } catch { /* 来源不可用则跳过 */ }
   const valid = [...found].filter((id) => /^cline-pass\/[a-z0-9._-]+$/.test(id));
-  const added = valid.filter((id) => !config.knownModels.includes(id));
+  const added = valid.filter((id) => !config.knownModels.includes(id) && !config.removedModels.includes(id));
   if (added.length) {
     config.knownModels.push(...added);
     saveConfig();
   }
-  META.officialModelsFetch = { ts: Date.now(), sources, found: valid.length, added, total: config.knownModels.length };
+  META.officialModelsFetch = { ts: Date.now(), sources, found: valid.length, added, total: activeModelIds().length };
   saveMeta();
-  return { sources, found: valid.length, added, knownModels: config.knownModels, ...META.officialModelsFetch };
+  return { sources, found: valid.length, added, knownModels: activeModelIds(), ...META.officialModelsFetch };
 }
 
 function record(modelId, info) {
@@ -768,19 +782,52 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (req.method === 'GET' && p === '/api/meta') {
-      return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), configured: isConfigured() });
+      return sendJSON(res, 200, { authRequired: true, proxyBase: publicProxyBase(), configured: isConfigured() });
     }
-    if (p.startsWith('/api/') || p.startsWith('/v1/') || CHAT_PATHS.has(p)) {
+    if (await adminAuth.handle(req, res, p)) return;
+    const proxyRoute = p.startsWith('/v1/') || p === '/models' || p === '/api/v1/models' || CHAT_PATHS.has(p);
+    if (proxyRoute) {
       if (!authOK(req)) return unauthorized(res);
+    } else if (p.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store');
+      if (!adminAuth.authorized(req)) return unauthorized(res);
+      if (!['GET', 'HEAD'].includes(req.method) && !adminAuth.sameOrigin(req)) {
+        return sendJSON(res, 403, { error: { message: '请求来源无效' } });
+      }
+    }
+    if (req.method === 'GET' && /\.(css|js|svg|png|webp|woff2)$/.test(p)) {
+      const filename = path.resolve(PUBLIC_DIR, '.' + p);
+      if (!filename.startsWith(PUBLIC_DIR + path.sep) || !fs.existsSync(filename) || !fs.statSync(filename).isFile()) {
+        return sendJSON(res, 404, { error: { message: 'Not found' } });
+      }
+      const types = { '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp', '.woff2': 'font/woff2' };
+      res.writeHead(200, { 'Content-Type': types[path.extname(filename)], 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
+      return fs.createReadStream(filename).pipe(res);
     }
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY' });
       return res.end(fs.readFileSync(path.join(PUBLIC_DIR, 'index.html')));
     }
     if (req.method === 'GET' && p === '/api/models') {
-      const cat = await catalog();
-      const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
-      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+      const cat = await modelCatalog();
+      const sub = activeModelIds().map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
+      return sendJSON(res, 200, { subscription: sub, selectedCatalogModels: config.selectedCatalogModels, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+    }
+    if (req.method === 'POST' && p === '/api/catalog-selection') {
+      let body;
+      try { body = JSON.parse((await readBody(req)).toString()); }
+      catch { return sendJSON(res, 400, { error: { message: '请求格式错误' } }); }
+      const { model, selected } = body || {};
+      if (typeof model !== 'string' || model.length > 256 || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(model) || typeof selected !== 'boolean') {
+        return sendJSON(res, 400, { error: { message: '模型或选择状态无效' } });
+      }
+      if (!(await modelCatalog()).includes(model)) return sendJSON(res, 400, { error: { message: '模型不在当前目录中，请刷新目录' } });
+      const previous = config.selectedCatalogModels;
+      const previousRemoved = config.removedModels;
+      config.selectedCatalogModels = selected && !config.knownModels.includes(model) ? [...new Set([...previous, model])] : previous.filter(id => id !== model);
+      config.removedModels = selected ? previousRemoved.filter(id => id !== model) : [...new Set([...previousRemoved, model])];
+      try { saveConfig(); } catch (e) { config.selectedCatalogModels = previous; config.removedModels = previousRemoved; throw e; }
+      return sendJSON(res, 200, { ok: true, selectedCatalogModels: config.selectedCatalogModels });
     }
     if (req.method === 'POST' && p === '/api/probe') {
       const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -914,8 +961,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/api/v1/models' || p === '/models')) {
       // 默认只暴露订阅模型，避免目录模型淹没客户端的模型选择器；exposeCatalog=true 时合并完整目录
       const ids = config.exposeCatalog
-        ? [...new Set([...config.knownModels, ...(await catalog())])]
-        : [...new Set([...config.knownModels, ...Object.keys(config.perModel)])];
+        ? [...new Set([...activeModelIds(), ...(await modelCatalog())])]
+        : activeModelIds();
       return sendJSON(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model' })) });
     }
     if (CHAT_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);

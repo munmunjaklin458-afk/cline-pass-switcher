@@ -1,10 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cline Pass 上游控制台</title>
-<style>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="color-scheme" content="light"><title>Cline Pass · 管理控制台</title><style>
   :root {
     --bg: #0f1115; --card: #171a21; --card2: #1d212b; --border: #2a2f3c;
     --text: #e6e9f0; --dim: #8b93a5; --accent: #4f8cff; --green: #34c77b; --orange: #f0a53c; --red: #e5534b;
@@ -82,27 +77,28 @@
   .trace .tr { font-family: Consolas, monospace; }
   .trace .tr.ok { color: var(--green); }
   .trace .tr.bad { color: var(--orange); }
-</style>
-</head>
-<body>
-  <div id="loginOverlay" style="display:none; position:fixed; inset:0; background:rgba(8,10,14,.85); z-index:50; align-items:center; justify-content:center;">
-    <div style="background:var(--card); border:1px solid var(--border); border-radius:12px; padding:28px; width:360px;">
-      <h2 style="font-size:16px; margin-bottom:6px;">Cline Pass 上游控制台</h2>
-      <p class="dim" style="font-size:13px; margin-bottom:14px;">此部署已启用代理密钥保护，请输入密钥访问控制台。</p>
-      <input id="loginKey" type="password" placeholder="代理密钥" style="width:100%; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:9px 10px; font-size:14px;">
-      <div id="loginErr" style="color:var(--red); font-size:12px; margin-top:6px;"></div>
-      <button style="width:100%; margin-top:12px;" onclick="tryLogin()">进入控制台</button>
+</style><link rel="stylesheet" href="/console.css"></head><body class="console-site"><a class="skip-link" href="#main-content">跳转到主要内容</a><main id="loginOverlay" class="login-page" hidden>
+ <a href="#models" class="brand"><span class="brand-mark"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span>Cline Pass<small>管理控制台</small></span></a>
+ <section class="login-card card" aria-labelledby="loginTitle"><span class="eyebrow">ADMIN LOGIN</span><h1 id="loginTitle">管理员登录</h1><p class="muted">登录 Cline Pass 管理后台。</p>
+ <form id="loginForm"><label class="field" for="loginKey">登录密码<input id="loginKey" name="password" type="password" required autocomplete="current-password" placeholder="请输入管理员密码"></label><div id="loginErr" class="notice error" role="alert" hidden></div><button id="loginBtn" class="btn primary wide" type="submit">登录 <span aria-hidden="true">→</span></button></form><p class="help login-help">请勿在公用设备上保存密码。</p></section>
+ <p class="login-foot">首次登录使用原有代理密钥，之后可在「访问与安全」中独立修改密码。</p><span class="login-foot">会话由安全 Cookie 管理 · 不在浏览器存储密码</span></main><div id="appShell" class="admin-shell" hidden><button class="sidebar-overlay" id="sidebarOverlay" aria-label="关闭导航" hidden></button><aside id="sidebar" class="admin-sidebar" aria-label="管理导航"><a class="brand" href="#models"><span class="brand-mark"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span>Cline Pass<small>管理控制台</small></span></a><nav aria-label="工作空间"><span class="nav-group">工作空间</span><a href="#models" data-view="models"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span>订阅模型</span></a><a href="#accounts" data-view="accounts"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6m2 4a5 5 0 0 1 3 5"/></svg><span>账号管理</span></a><span class="nav-group">调用工具</span><a href="#test" data-view="test"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 3 13 9-13 9z"/></svg><span>请求测试</span></a><a href="#history" data-view="history"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>请求历史</span></a><a href="#catalog" data-view="catalog"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 3h6a3 3 0 0 1 3 3v15a4 4 0 0 0-4-2H3V3zm9 3a3 3 0 0 1 3-3h5v16h-4a4 4 0 0 0-4 2"/></svg><span>模型目录</span></a><span class="nav-group">运营与安全</span><a href="#security" data-view="security"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/></svg><span>访问与安全</span></a></nav><div class="sidebar-bottom"><div class="sidebar-note">OpenAI 兼容代理<small>优先级 · 观测 · 自动回退</small></div><div class="user-block"><span class="avatar">A</span><div><strong>Administrator</strong><small>管理员</small></div><button class="icon-btn" id="logoutBtn" aria-label="退出登录" title="退出登录"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4H4v16h5m5-13 5 5-5 5m-6-5h13"/></svg></button></div></div></aside><div class="admin-workspace"><header class="admin-topbar"><div class="inline"><button class="icon-btn admin-menu" id="menuToggle" aria-label="展开管理导航" aria-expanded="false" aria-controls="sidebar"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button><span class="muted">工作空间</span><span class="breadcrumb-divider">/</span><strong id="viewTitle">订阅模型</strong></div><button class="ghost" id="refreshBtn" onclick="loadAll()">刷新数据</button></header><main id="main-content" class="admin-main"><div class="connection-bar"><span class="live-dot" aria-hidden="true"></span><button class="proxy-address" id="proxyBase" title="复制 OpenAI 兼容 Base URL">正在连接代理…</button><span class="connection-label">OPENAI COMPATIBLE</span></div><div id="globalError" class="notice error" role="alert" hidden></div><div id="status" role="status" aria-live="polite"></div><div id="noKeyBanner" class="notice info" style="display:none"><b>尚未配置上游 API Key</b>：请前往「账号管理」添加 sk_ 开头的 Cline Pass 密钥并保存；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。</div><section id="view-models" class="view" data-panel="models" hidden><header class="admin-heading"><div><span class="eyebrow">MODELS / CONSOLE</span><h1 tabindex="-1">订阅模型</h1><p>管理订阅模型、上游优先级与自动故障转移。</p></div><button class="ghost" onclick="probeAll()" id="probeAllBtn">批量探测订阅模型</button></header><div class="stat-grid"><div class="card"><span>订阅模型</span><strong id="modelCount">—</strong><small>可配置的订阅模型</small></div><div class="card"><span>账号池</span><strong id="accountCount">—</strong><small id="accountMode">等待加载</small></div><div class="card"><span>公开目录</span><strong id="catalogCount">—</strong><small>Cline 模型目录</small></div></div>  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h2 style="margin:0">模型列表（订阅 + 手动添加）</h2>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <span class="dim" style="font-size:12px" id="officialInfo"></span>
+        <button class="ghost" onclick="fetchOfficial(this)" title="从 Cline 官方推荐模型接口、官方文档与社区注册表拉取最新订阅模型清单并合并（只增不删）">⬇ 拉取官方最新模型</button>
+      </div>
     </div>
+    <div class="result" id="fetchResult" style="display:none; margin-bottom:12px;"></div>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="订阅模型表格"><table>
+      <thead><tr>
+        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序</th><th>操作</th>
+      </tr></thead>
+      <tbody id="subBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    </table></div>
   </div>
 
-  <h1>Cline Pass 上游控制台</h1>
-  <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的上游，多上游按优先级自动故障转移，支持精确钉住 / 优先回退 / 排除上游 / 成本·首字·吞吐排序</div>
-
-  <div id="noKeyBanner" class="banner" style="display:none; border-left-color: var(--red);">
-    <b>尚未配置上游 API Key：</b>在下方「账号管理」添加你的 Cline Pass 账号（sk_ 开头的 key）并保存即可开始使用；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。
-  </div>
-
-  <div class="banner">
+<details class="card usage-guide"><summary>上游路由与故障转移说明</summary><div class="guide-copy">
     <b>实测结论（决定了本工具的工作方式）：</b><br>
     ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
     「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
@@ -113,129 +109,166 @@
     两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
     ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
     ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
-  </div>
-
-  <div class="toolbar">
-    <span class="chip" id="proxyBase" title="点击复制：把任意 OpenAI 兼容客户端的 Base URL 指向这里"></span>
-    <button class="ghost" onclick="loadAll()">↻ 刷新</button>
-    <button class="ghost" onclick="probeAll()" id="probeAllBtn">批量探测订阅模型</button>
-    <span class="dim" style="font-size:12px" id="status"></span>
-  </div>
-
-  <div class="card">
+  </div></details></section><section id="view-accounts" class="view" data-panel="accounts" hidden><header class="admin-heading"><div><span class="eyebrow">ACCOUNTS / CONSOLE</span><h1 tabindex="-1">账号管理</h1><p>配置 Cline Pass 账号池，按需切换单账号与轮询模式。</p></div></header>  <div class="card">
     <h2>账号管理（Cline Pass 账号池）</h2>
-    <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">模式：</label>
+    <form id="accountsForm" style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
+      <label for="accMode" class="dim" style="font-size:13px">模式：</label>
       <select id="accMode">
         <option value="single">单账号（手动指定）</option>
         <option value="roundrobin">账号池轮询</option>
       </select>
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
-      <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
-      <button onclick="saveAccounts()">保存账号配置</button>
+      <button class="ghost" type="button" onclick="addAccountRow()">＋ 添加账号</button>
+      <button type="submit">保存账号配置</button>
       <span class="dim" style="font-size:12px" id="accMsg"></span>
-    </div>
-    <table>
+    </form>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="账号管理表格"><table>
       <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
       <tbody id="accBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
-    </table>
+    </table></div>
   </div>
 
-  <div class="card">
-    <h2>访问与安全（下游密钥）</h2>
+</section><section id="view-test" class="view" data-panel="test" hidden><header class="admin-heading"><div><span class="eyebrow">TEST / CONSOLE</span><h1 tabindex="-1">请求测试</h1><p>发送真实请求，检查目标上游与实际命中结果。</p></div></header>  <div class="card">
+    <h2>测试台（发一条真实请求，验证目标上游是否被网关采纳）</h2>
+    <form id="testForm" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <label class="sr-only" for="testModel">测试模型</label><select id="testModel" style="min-width:240px"></select>
+      <label class="sr-only" for="testUpstream">目标上游</label><select id="testUpstream" style="min-width:200px"><option value="">自动（不指定上游）</option></select>
+      <button type="submit" id="testBtn">发送测试</button>
+      <span class="dim" style="font-size:12px">使用 max_tokens=256 的小请求，消耗极小</span>
+    </form>
+    <div class="result" id="testResult"></div>
+  </div>
+
+</section><section id="view-history" class="view" data-panel="history" hidden><header class="admin-heading"><div><span class="eyebrow">HISTORY / CONSOLE</span><h1 tabindex="-1">请求历史</h1><p>查看最近 100 条代理请求与完整的上游尝试序列。</p></div></header>  <div class="card">
+    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="请求历史表格"><table>
+      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
+    </table></div>
+  </div>
+
+</section><section id="view-catalog" class="view" data-panel="catalog" hidden><header class="admin-heading"><div><span class="eyebrow">CATALOG / CONSOLE</span><h1 tabindex="-1">模型目录</h1><p>浏览 Cline 公开目录，查找并探测可用模型。</p></div></header>  <div class="card">
+    <h2>完整模型目录（Cline 公开目录，含 :free 可钉住模型）</h2>
+    <div style="margin-bottom:10px">
+      <label class="dim" style="font-size:13px"><input type="checkbox" id="exposeCatalog" onchange="saveExposeCatalog(this.checked)"> 开放全部目录到 /v1/models（关闭时仅显示订阅模型与手动添加的模型）</label>
+    </div>
+    <details open>
+      <summary id="catSummary">展开</summary>
+      <label for="catFilter" class="sr-only">搜索模型目录</label><input id="catFilter" placeholder="输入过滤… 如 free / glm / anthropic" style="margin:10px 0; width:300px; display:block">
+      <div class="table-scroll" tabindex="0" role="region" aria-label="模型目录表格"><table><tbody id="catBody"></tbody></table></div>
+    </details>
+  </div>
+
+</section><section id="view-security" class="view" data-panel="security" hidden><header class="admin-heading"><div><span class="eyebrow">SECURITY / CONSOLE</span><h1 tabindex="-1">访问与安全</h1><p>分别管理控制台登录密码与下游 API 访问凭证。</p></div></header><section class="card password-card" aria-labelledby="passwordTitle"><div class="card-heading"><h2 id="passwordTitle">登录密码</h2><p class="muted">独立保护管理控制台，不影响客户端使用的 API 密钥。</p></div><form id="passwordForm"><label class="field" for="currentPassword">当前密码<input type="password" id="currentPassword" name="currentPassword" required autocomplete="current-password"></label><label class="field" for="newPassword">新密码<input type="password" id="newPassword" name="newPassword" minlength="8" maxlength="256" placeholder="8–256 个字符" required autocomplete="new-password"></label><label class="field" for="confirmPassword">确认新密码<input type="password" id="confirmPassword" name="confirm" required autocomplete="new-password"></label><p class="help">修改成功后需要重新登录。代理 API 密钥保持不变。</p><div id="passwordMsg" class="notice error" role="alert" hidden></div><button type="submit" id="passwordBtn">修改登录密码</button></form></section>  <div class="card">
+    <h2>下游 API 访问</h2><form id="securityForm">
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">代理密钥：</label>
-      <input id="secProxyKey" type="password" placeholder="空 = 关闭鉴权" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
+      <label for="secProxyKey" class="dim" style="font-size:13px">代理密钥：</label>
+      <input id="secProxyKey" type="password" placeholder="留空仅关闭下游 API 鉴权" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
       <label class="dim" style="font-size:12px"><input type="checkbox" id="secShow" onchange="$('#secProxyKey').type=this.checked?'text':'password'"> 显示</label>
       <span id="secBadge" class="badge"></span>
     </div>
     <div style="display:flex; gap:10px; align-items:center; margin-top:8px; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">公网代理地址：</label>
+      <label for="secPublicBase" class="dim" style="font-size:13px">公网代理地址：</label>
       <input id="secPublicBase" placeholder="如 https://cline.xxx.sslip.io（本地留空）" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
     </div>
     <div style="display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap;">
-      <button onclick="saveSecurity()">保存访问设置</button>
-      <span class="dim" style="font-size:12px">修改密钥后，客户端需改用新密钥；控制台会自动更新本机保存的密钥，不会被锁在外面。</span>
+      <button type="submit">保存访问设置</button>
+      <span class="dim" style="font-size:12px">仅影响下游 API 调用。修改代理密钥不会更改登录密码或退出当前会话。</span>
       <span class="dim" style="font-size:12px" id="secMsg"></span>
     </div>
-  </div>
-
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-      <h2 style="margin:0">订阅模型（cline-pass/*）</h2>
-      <div style="display:flex; gap:10px; align-items:center;">
-        <span class="dim" style="font-size:12px" id="officialInfo"></span>
-        <button class="ghost" onclick="fetchOfficial(this)" title="从 Cline 官方推荐模型接口、官方文档与社区注册表拉取最新订阅模型清单并合并（只增不删）">⬇ 拉取官方最新模型</button>
-      </div>
-    </div>
-    <div class="result" id="fetchResult" style="display:none; margin-bottom:12px;"></div>
-    <table>
-      <thead><tr>
-        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序</th><th>操作</th>
-      </tr></thead>
-      <tbody id="subBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>测试台（发一条真实请求，验证目标上游是否被网关采纳）</h2>
-    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-      <select id="testModel" style="min-width:240px"></select>
-      <select id="testUpstream" style="min-width:200px"><option value="">自动（不指定上游）</option></select>
-      <button onclick="runTest()" id="testBtn">发送测试</button>
-      <span class="dim" style="font-size:12px">使用 max_tokens=256 的小请求，消耗极小</span>
-    </div>
-    <div class="result" id="testResult"></div>
-  </div>
-
-  <div class="card">
-    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
-    <table>
-      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
-      <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>完整模型目录（Cline 公开目录，含 :free 可钉住模型）</h2>
-    <div style="margin-bottom:10px">
-      <label class="dim" style="font-size:13px"><input type="checkbox" id="exposeCatalog" onchange="saveExposeCatalog(this.checked)"> 把目录模型加入代理的 /v1/models（默认关闭：客户端只看到订阅模型）</label>
-    </div>
-    <details>
-      <summary id="catSummary">展开</summary>
-      <input id="catFilter" placeholder="输入过滤… 如 free / glm / anthropic" style="margin:10px 0; width:300px; display:block">
-      <table><tbody id="catBody"></tbody></table>
-    </details>
-  </div>
-
-<script>
+  </form></div></section></main><footer class="admin-footer"><span>Cline Pass · 上游控制台</span><span>本地代理 / 安全会话</span></footer></div></div><script>
 let DATA = null;
-let AUTH_KEY = localStorage.getItem('cps_key') || '';
+let AUTHENTICATED = false;
+let authGeneration = 0;
+// Migrate away from legacy browser-stored administrator credentials.
+try { localStorage.removeItem('cps_key'); } catch (_) {}
 const $ = (s) => document.querySelector(s);
 const fmt = (ts) => new Date(ts).toLocaleTimeString();
-
+const errorText = (e) => typeof e === 'string' ? e : e?.message || '请求失败，请稍后重试';
+function reportError(error) {
+  const el = AUTHENTICATED ? $('#globalError') : $('#loginErr');
+  el.textContent = errorText(error); el.hidden = false;
+}
 async function api(path, body) {
-  const headers = body ? { 'Content-Type': 'application/json' } : {};
-  if (AUTH_KEY) headers['X-Admin-Key'] = AUTH_KEY;
-  const res = await fetch(path, body ? { method: 'POST', headers, body: JSON.stringify(body) } : { headers });
-  if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
-  return res.json();
-}
-
-function showLogin() { $('#loginOverlay').style.display = 'flex'; setTimeout(() => $('#loginKey').focus(), 50); }
-async function tryLogin() {
-  const k = $('#loginKey').value.trim();
-  if (!k) return;
-  const res = await fetch('/api/models', { headers: { 'X-Admin-Key': k } });
-  if (res.ok) {
-    AUTH_KEY = k; localStorage.setItem('cps_key', k);
-    $('#loginOverlay').style.display = 'none'; $('#loginErr').textContent = '';
-    loadAll();
-  } else {
-    $('#loginErr').textContent = '密钥错误，请重试';
+  let res;
+  try {
+    res = await fetch(path, {method:body !== undefined ? 'POST' : 'GET', credentials:'same-origin', headers:body !== undefined ? {'Content-Type':'application/json'} : {}, ...(body !== undefined ? {body:JSON.stringify(body)} : {})});
+  } catch (_) { throw new Error('网络连接失败，请检查连接后重试。'); }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && path !== '/api/auth/login' && path !== '/api/auth/password') {
+    showLogin('会话已过期，请重新登录。');
+    throw new Error('会话已过期，请重新登录。');
   }
+  // Operational test/probe failures carry traces in a non-2xx JSON response.
+  if (!res.ok && ['/api/test','/api/probe','/api/accounts/test'].includes(path) && res.status !== 401 && data.ok === false) return data;
+  if (!res.ok) throw new Error(errorText(data.error || data.message || `请求失败（HTTP ${res.status}）`));
+  return data;
 }
-
+function showLogin(message = '') {
+  AUTHENTICATED = false; authGeneration++;
+  setDrawer(false, false);
+  $('#appShell').hidden = true; $('#loginOverlay').hidden = false;
+  $('#loginErr').textContent = message; $('#loginErr').hidden = !message;
+  $('#loginKey').value = ''; $('#passwordForm').reset();
+  DATA = null; ACCS = null;
+  // Clear privileged content so stale sessions never leave account keys in DOM.
+  $('#accBody').replaceChildren(); $('#subBody').replaceChildren(); $('#histBody').replaceChildren(); $('#catBody').replaceChildren();
+  $('#secProxyKey').value = ''; $('#secPublicBase').value = '';
+  $('#testResult').replaceChildren(); $('#testResult').style.display='none';
+  requestAnimationFrame(() => $('#loginKey').focus());
+}
+function showConsole() {
+  AUTHENTICATED = true; $('#loginOverlay').hidden = true; $('#appShell').hidden = false;
+  navigate(location.hash.slice(1) || 'models', false);
+}
+async function tryLogin() {
+  const btn = $('#loginBtn'); if (btn.disabled) return;
+  btn.disabled = true; btn.textContent = '正在验证…'; $('#loginErr').hidden = true;
+  try {
+    await api('/api/auth/login', {password:$('#loginKey').value});
+    $('#loginKey').value = '';
+    await loadAll();
+    showConsole();
+  } catch (e) { reportError(e); }
+  finally { btn.disabled = false; btn.innerHTML = '登录 <span aria-hidden="true">→</span>'; }
+}
+async function logout() {
+  const btn = $('#logoutBtn'); btn.disabled = true;
+  try { await api('/api/auth/logout', {}); showLogin(); }
+  catch (e) { reportError(e); }
+  finally { btn.disabled = false; }
+}
+async function changePassword() {
+  const btn=$('#passwordBtn'), message=$('#passwordMsg');
+  message.hidden=true;
+  if ($('#newPassword').value !== $('#confirmPassword').value) { message.textContent='两次输入的新密码不一致。'; message.hidden=false; $('#confirmPassword').focus(); return; }
+  btn.disabled=true; btn.textContent='正在修改…';
+  try {
+    await api('/api/auth/password', {currentPassword:$('#currentPassword').value,newPassword:$('#newPassword').value});
+    // Password endpoint revokes all sessions. Also explicitly clear this cookie.
+    let logoutFailed = false;
+    try { await api('/api/auth/logout', {}); } catch (_) { logoutFailed = true; }
+    showLogin(logoutFailed ? '密码已修改，请使用新密码登录。清理登录 Cookie 失败，服务端原有会话已失效。' : '密码已修改，请使用新密码重新登录。API 密钥未改变。');
+  } catch (e) { message.textContent=errorText(e); message.hidden=false; }
+  finally { btn.disabled=false; btn.textContent='修改登录密码'; }
+}
+const VIEW_LABELS = {models:'订阅模型',accounts:'账号管理',test:'请求测试',history:'请求历史',catalog:'模型目录',security:'访问与安全'};
+function navigate(view, focus = true) {
+  if (!VIEW_LABELS[view]) view='models';
+  document.querySelectorAll('[data-panel]').forEach(el => el.hidden=el.dataset.panel!==view);
+  document.querySelectorAll('nav [data-view]').forEach(el => { const active=el.dataset.view===view; el.classList.toggle('router-link-active',active); if(active) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); });
+  $('#viewTitle').textContent=VIEW_LABELS[view]; document.title=VIEW_LABELS[view]+' · Cline Pass';
+  setDrawer(false,false);
+  if (focus && AUTHENTICATED) $('#view-'+view+' h1').focus({preventScroll:true});
+}
+function setDrawer(open, restore = true) {
+  $('#sidebar').classList.toggle('open',open); $('#sidebarOverlay').hidden=!open;
+  $('#menuToggle').setAttribute('aria-expanded',String(open)); document.body.classList.toggle('drawer-open',open);
+  $('#main-content').inert = open;
+  $('.admin-topbar').inert = open;
+  $('.admin-footer').inert = open;
+  if(open) $('#sidebar a').focus(); else if(restore && AUTHENTICATED) $('#menuToggle').focus();
+}
 const ST_TAG = { ok: '✔可用', limited: '⏳限流', bad: '✘不可钉', auth: '🔑key错' };
 const ST_RANK = { ok: 0, limited: 1, unknown: 2, auth: 3, bad: 4 };
 const ST_CLS = { ok: 'ok', limited: 'limited', bad: 'bad', auth: 'auth' };
@@ -331,11 +364,11 @@ function render() {
         ${upstreamPanel(s.id, m, s.config)}
       </td>
       <td>
-        <div><select onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
+        <div><select aria-label="模型路由设置" onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
           <option value="strict" ${mode === 'strict' ? 'selected' : ''}>严格钉住</option>
           <option value="preferred" ${mode === 'preferred' ? 'selected' : ''}>优先+回退</option>
         </select></div>
-        <select onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
+        <select aria-label="模型路由设置" onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
           <option value="" ${!sort ? 'selected' : ''}>网关智能选</option>
           <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
           <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
@@ -345,51 +378,89 @@ function render() {
       <td><div class="row-actions">
         <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
         <button class="ghost" onclick="test('${s.id}', this)">测试</button>
+        <button class="ghost remove-model" data-model="${escapeHtml(s.id)}">移除</button>
         <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
       </div></td>
     </tr>`;
   }).join('');
   $('#subBody').innerHTML = rows;
 
+  const selectedModel = $('#testModel').value, selectedUpstream = $('#testUpstream').value;
   $('#testModel').innerHTML = DATA.subscription.map((s) => `<option value="${s.id}">${s.id}</option>`).join('');
+  if ([...$('#testModel').options].some(o => o.value === selectedModel)) $('#testModel').value = selectedModel;
   onTestModelChange();
+  if ([...$('#testUpstream').options].some(o => o.value === selectedUpstream)) $('#testUpstream').value = selectedUpstream;
 
   $('#catSummary').textContent = `展开（共 ${DATA.catalogCount} 个目录模型）`;
   const of = DATA.officialFetch;
   $('#officialInfo').textContent = of ? `上次拉取 ${new Date(of.ts).toLocaleString()}（${(of.sources || []).join('+')}，新增 ${of.added.length}）` : '尚未拉取过官方清单';
   renderCatalog();
 
-  loadHistory();
 }
 
 function renderCatalog() {
   const f = ($('#catFilter').value || '').toLowerCase();
   const list = DATA.catalog.filter((id) => !f || id.toLowerCase().includes(f)).slice(0, 400);
   $('#catBody').innerHTML = list.map((id) => {
-    const m = DATA.subscription.find((s) => s.id === id)?.meta;
+    const entry = DATA.subscription.find((s) => s.id === id);
+    const m = entry?.meta;
+    const selected = !!entry;
     const pinnable = id.includes(':free');
     return `<tr><td class="mono">${id}</td><td>${pinnable ? '<span class="badge green">:free 可精确钉住</span>' : '<span class="badge orange">规划器管理</span>'}</td>
     <td>${m?.lastProvider ? '<span class="badge">' + m.lastProvider + '</span>' : ''}</td>
-    <td><button class="ghost" onclick="probe('${id}', this)">探测</button></td></tr>`;
+    <td><div class="catalog-actions"><button class="ghost" onclick="probe('${id}', this)">探测</button><button class="ghost catalog-select" data-model="${escapeHtml(id)}" data-selected="${selected}" ${entry && !selected ? 'disabled' : ''}>${selected ? '移除' : entry ? '已在订阅列表' : '加入模型列表'}</button></div></td></tr>`;
   }).join('') || '<tr><td class="empty">无匹配</td></tr>';
 }
 
+$('#catBody').addEventListener('click', async (event) => {
+  const btn = event.target.closest('.catalog-select');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const selected = btn.dataset.selected !== 'true';
+    await api('/api/catalog-selection', {model: btn.dataset.model, selected});
+    await loadAll();
+    status(selected ? '已加入模型列表；客户端刷新模型列表后可见。权限与计费仍由上游决定。' : '已移除；如果开启了完整目录，客户端仍会看到该模型。');
+  } catch (e) { reportError(e); }
+  finally { btn.disabled = false; }
+});
+
+$('#subBody').addEventListener('click', async (event) => {
+  const btn = event.target.closest('.remove-model');
+  if (!btn || btn.disabled) return;
+  if (!confirm(`从模型列表移除 ${btn.dataset.model}？模型目录仍保留，可随时重新添加；下次官方拉取不会自动恢复。此操作不是禁止 API 调用。`)) return;
+  btn.disabled = true;
+  try {
+    await api('/api/catalog-selection', {model: btn.dataset.model, selected: false});
+    await loadAll();
+    status('已从模型列表移除，可在模型目录重新添加。开启完整目录时，客户端仍会看到该模型。');
+  } catch (e) { reportError(e); }
+  finally { btn.disabled = false; }
+});
+
 async function loadAll() {
+  const generation = authGeneration;
   const [models, accs, sec, meta] = await Promise.all([api('/api/models'), api('/api/accounts'), api('/api/security'), api('/api/meta')]);
+  if (generation !== authGeneration) throw new Error('会话状态已改变，请重新登录。');
   DATA = models;
   ACCS = accs;
   render();
   renderAccounts();
   renderSecurity(sec);
   $('#noKeyBanner').style.display = meta.configured ? 'none' : 'block';
+  $('#modelCount').textContent = models.subscription.length;
+  $('#catalogCount').textContent = models.catalogCount;
+  $('#accountCount').textContent = accs.accounts.length;
+  $('#accountMode').textContent = accs.mode === 'roundrobin' ? '账号池轮询' : '单账号模式';
+  await loadHistory();
 }
 
 function renderSecurity(sec) {
   $('#secProxyKey').value = sec.proxyKey || '';
   $('#secPublicBase').value = sec.publicBaseUrl || '';
   const badge = $('#secBadge');
-  badge.textContent = sec.authRequired ? '鉴权已开启' : '鉴权已关闭';
-  badge.className = sec.authRequired ? 'badge green' : 'badge orange';
+  badge.textContent = sec.proxyKey ? 'API 鉴权已开启' : 'API 鉴权已关闭';
+  badge.className = sec.proxyKey ? 'badge green' : 'badge orange';
   const ec = $('#exposeCatalog');
   if (ec) ec.checked = !!sec.exposeCatalog;
 }
@@ -407,12 +478,10 @@ async function saveSecurity() {
   };
   const r = await api('/api/security', payload);
   if (r.ok) {
-    // 控制台鉴权与代理密钥同源：改完立即换新密钥，避免会话失效
-    if (r.proxyKey) { AUTH_KEY = r.proxyKey; localStorage.setItem('cps_key', r.proxyKey); }
     renderSecurity(r);
     DATA.proxyBase = r.proxyBase;
     $('#proxyBase').textContent = '代理地址：' + r.proxyBase + '（点击复制）';
-    secMsg('已保存' + (r.authRequired ? '，鉴权开启' : '，鉴权已关闭（任何客户端都可访问代理）'));
+    secMsg('已保存' + (r.proxyKey ? '，API 鉴权开启' : '，鉴权已关闭（任何客户端都可访问代理）'));
   } else secMsg(r.error?.message || '保存失败', true);
 }
 
@@ -456,8 +525,27 @@ async function test(id, btn) {
 }
 
 let LAST_ADDED = [];
+let fetchResultTimer;
+function dismissFetchResult() {
+  clearTimeout(fetchResultTimer);
+  $('#fetchResult').style.display = 'none';
+  $('#fetchResult').replaceChildren();
+  LAST_ADDED = [];
+  document.querySelectorAll('#subBody .row-new').forEach(row => row.classList.remove('row-new'));
+}
+function scheduleFetchResultDismiss() {
+  const close = document.createElement('button');
+  close.className = 'ghost';
+  close.textContent = '关闭';
+  close.setAttribute('aria-label', '关闭拉取结果');
+  close.onclick = dismissFetchResult;
+  $('#fetchResult').prepend(close);
+  clearTimeout(fetchResultTimer);
+  fetchResultTimer = setTimeout(dismissFetchResult, 6000);
+}
 async function fetchOfficial(btn) {
   btn.disabled = true; btn.textContent = '拉取中…';
+  dismissFetchResult();
   const el = $('#fetchResult');
   try {
     const r = await api('/api/fetch-official-models', {});
@@ -469,12 +557,13 @@ async function fetchOfficial(btn) {
       <div>官方清单 <b>${r.found} 个</b></div>
       <div>新增 <b class="${r.added.length ? 'match' : 'dim'}">${r.added.length} 个</b></div>
       <div>合并后 <b>${r.knownModels.length} 个</b></div>
-    </div>${r.added.length ? '✔ 检测到新模型，已加入下方列表并高亮显示：' + r.added.join('、') : '✔ 清单已是最新：官方渠道 ' + r.found + ' 个模型均已覆盖，现有 ' + r.knownModels.length + ' 个订阅模型保持不变。'}`;
+    </div>${r.added.length ? '✔ 检测到新模型，已加入下方列表并高亮显示：' + r.added.join('、') : '✔ 拉取完成：无新增模型，当前列表 ' + r.knownModels.length + ' 个模型；手动移除的模型不会自动恢复。'}`;
     await loadAll();
-    setTimeout(() => { LAST_ADDED = []; }, 6000);
+    scheduleFetchResultDismiss();
   } catch (e) {
     el.style.display = 'block';
     el.innerHTML = '<span class="mismatch">拉取失败，请稍后重试</span>';
+    scheduleFetchResultDismiss();
   }
   btn.disabled = false; btn.textContent = '⬇ 拉取官方最新模型';
 }
@@ -513,6 +602,8 @@ function traceHtml(trace) {
 }
 
 function showTest(r, model, target) {
+  if (!AUTHENTICATED) return;
+  location.hash='test'; navigate('test');
   const el = $('#testResult'); el.style.display = 'block';
   const targets = Array.isArray(target) ? target : target ? [target] : [];
   if (!r.ok) {
@@ -551,8 +642,9 @@ async function saveModelCfg(id, patch) {
       status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
       await loadAll();
     }
-  } catch {
-    await loadAll();
+  } catch (e) {
+    reportError(e);
+    if (AUTHENTICATED) await loadAll();
   }
 }
 
@@ -675,10 +767,10 @@ function renderAccounts() {
     const st = (ACCS.stats || {})[a.name] || {};
     const checked = ACCS.mode === 'single' && i === ACCS.active;
     return `<tr>
-      <td><input type="radio" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="轮询模式下按顺序轮流使用"' : 'title="单账号模式下使用此账号"'}></td>
-      <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
-      <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
-      <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
+      <td><input type="radio" aria-label="选择账号 ${i + 1}" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="轮询模式下按顺序轮流使用"' : 'title="单账号模式下使用此账号"'}></td>
+      <td><input aria-label="账号 ${i + 1} 名称" class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
+      <td><input aria-label="账号 ${i + 1} API Key" autocomplete="off" class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
+      <td><input type="checkbox" aria-label="启用账号 ${i + 1}" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
       <td><div class="row-actions">
@@ -728,8 +820,7 @@ function delAccount(i) {
 }
 
 async function testAccount(i, btn) {
-  collectAccounts();
-  const acc = ACCS.accounts[i];
+  const acc = collectAccounts().accounts[i];
   if (!acc.key) { accMsg('请先填写该账号的 key', true); return; }
   btn.disabled = true; btn.textContent = '测试中…'; accMsg(`正在测试 ${acc.name} …`);
   const r = await api('/api/accounts/test', { key: acc.key });
@@ -753,20 +844,59 @@ function accMsg(msg, isErr) {
 let statusTimer;
 function status(msg) { $('#status').textContent = msg; clearTimeout(statusTimer); statusTimer = setTimeout(() => $('#status').textContent = '', 6000); }
 
-$('#proxyBase').onclick = () => navigator.clipboard.writeText(DATA.proxyBase).then(() => status('已复制代理地址'));
+
+$('#proxyBase').onclick = async () => {
+  if (!DATA) return;
+  try { await navigator.clipboard.writeText(DATA.proxyBase); status('已复制代理地址'); }
+  catch (_) { reportError('无法访问剪贴板，请手动复制：'+DATA.proxyBase); }
+};
 $('#testModel').addEventListener('change', onTestModelChange);
-$('#catFilter').addEventListener('input', renderCatalog);
-$('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLogin(); });
-// 仅当服务端开启鉴权且本地没有已保存的密钥时才弹登录框
+$('#catFilter').addEventListener('input', () => { if(DATA) renderCatalog(); });
+$('#loginForm').addEventListener('submit', e => { e.preventDefault(); tryLogin(); });
+$('#passwordForm').addEventListener('submit', e => { e.preventDefault(); changePassword(); });
+$('#accountsForm').addEventListener('submit', e => { e.preventDefault(); saveAccounts(); });
+$('#securityForm').addEventListener('submit', e => { e.preventDefault(); saveSecurity(); });
+$('#testForm').addEventListener('submit', e => { e.preventDefault(); runTest(); });
+$('#logoutBtn').addEventListener('click',logout);
+$('#menuToggle').addEventListener('click', () => setDrawer(!$('#sidebar').classList.contains('open')));
+$('#sidebarOverlay').addEventListener('click', () => setDrawer(false));
+window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
+document.querySelectorAll('[data-view]').forEach(el => el.addEventListener('click', () => navigate(el.dataset.view)));
+window.matchMedia('(min-width: 761px)').addEventListener('change', e => {if(e.matches) setDrawer(false,false)});
+document.addEventListener('keydown',e => {
+  if(!$('#sidebar').classList.contains('open')) return;
+  if(e.key==='Escape') {e.preventDefault();setDrawer(false);}
+  if(e.key==='Tab') {
+    const nodes=[...$('#sidebar').querySelectorAll('a,button:not(:disabled)')];
+    if(e.shiftKey && document.activeElement===nodes[0]) {e.preventDefault();nodes.at(-1).focus();}
+    else if(!e.shiftKey && document.activeElement===nodes.at(-1)) {e.preventDefault();nodes[0].focus();}
+  }
+});
+// Unified action boundary: return actionable errors and always release busy controls.
+function guarded(fn) {
+  return async function(...args) {
+    const button=args.find(x => x instanceof HTMLButtonElement) || ({runTest:$('#testBtn'),probeAll:$('#probeAllBtn'),saveAccounts:$('#accountsForm button[type=submit]'),saveSecurity:$('#securityForm button[type=submit]')})[fn.name] || (document.activeElement instanceof HTMLButtonElement ? document.activeElement : null);
+    const text=button?.textContent;
+    $('#globalError').hidden=true;
+    try { return await fn(...args); }
+    catch(e) { reportError(e); }
+    finally { if(button) {button.disabled=false; if(text) button.textContent=text;} }
+  };
+}
+for (const name of ['probe','probeAll','test','runTest','fetchOfficial','validate','saveAccounts','saveSecurity','testAccount','saveExposeCatalog']) window[name]=guarded(window[name]);
+const loadAllInternal=loadAll;
+// Event handlers get a safe boundary; login/bootstrap retain rejecting loadAll.
+$('#refreshBtn').removeAttribute('onclick');
+$('#refreshBtn').addEventListener('click',guarded(loadAllInternal));
+window.addEventListener('unhandledrejection',event => { event.preventDefault(); reportError(event.reason); });
 (async () => {
   try {
-    const meta = await (await fetch('/api/meta')).json();
-    if (meta.authRequired && !AUTH_KEY) showLogin();
-    else loadAll().catch(() => {});
-  } catch {
-    loadAll().catch(() => {});
+    await api('/api/meta');
+    await loadAll();
+    showConsole();
+  } catch (e) {
+    if ($('#loginOverlay').hidden) showLogin();
+    if (!/会话已过期/.test(errorText(e))) reportError(e);
   }
 })();
-</script>
-</body>
-</html>
+</script></body></html>
