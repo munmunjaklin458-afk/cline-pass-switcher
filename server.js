@@ -61,8 +61,34 @@ function loadJson(file, fallback) {
 }
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
-const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+// Windows 下 config/metadata 偶发被杀软实时扫描、网盘同步或搜索索引短暂锁住（EBUSY/EPERM），
+// 直接写目标文件一旦撞上，异常还会顺着流式回调变成未处理 error 事件把整个进程炸掉。
+// 因此先写临时文件再 rename 原子替换，瞬时占用按 50/100/200/400ms 同步重试；
+// 重试耗尽只告警不抛错 —— 丢一次统计写入可接受，代理进程崩溃不可接受。
+const _sleepI32 = new Int32Array(new SharedArrayBuffer(4));
+const sleepSync = (ms) => Atomics.wait(_sleepI32, 0, 0, ms);
+
+function writeJsonFile(file, data) {
+  const delays = [50, 100, 200, 400];
+  for (let i = 0; ; i++) {
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, data);
+      fs.renameSync(tmp, file);
+      return;
+    } catch (e) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+      const transient = ['EBUSY', 'EPERM', 'EACCES', 'EMFILE'].includes(e.code);
+      if (!transient || i >= delays.length) {
+        console.warn(`[警告] ${path.basename(file)} 写入失败（${e.code || e.message}），本次修改仅保留在内存中，不影响服务`);
+        return;
+      }
+      sleepSync(delays[i]);
+    }
+  }
+}
+const saveConfig = () => writeJsonFile(CONFIG_PATH, JSON.stringify(config, null, 2));
+const saveMeta = () => writeJsonFile(META_PATH, JSON.stringify(META, null, 2));
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -549,6 +575,22 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
+// 瞬时故障特征：网关抖动（shared 池高并发时 failed to invoke / stream_initialization_failed 很常见）、
+// 5xx、429、网络错误、超时。这类失败换一次同样的请求往往就成功，值得原样重放；401/404/400 等确定性失败不重放。
+const TRANSIENT_RE = /failed to (invoke|create stream)|stream_initialization_failed|overloaded|rate.?limit|timeout|temporarily|unavailable|bad gateway|internal server|fetch failed|ECONN|socket hang up/i;
+// 推理模型耗尽 max_tokens 时网关返回 200 但 content 为空（客户端表现为 empty response）。
+// 有 tool_calls 的空 content 是正常响应（工具调用），不算空。
+function isEmptyCompletion(out) {
+  if (!Array.isArray(out?.choices) || !out.choices.length) return true;
+  const msg = out.choices[0]?.message;
+  if (typeof msg?.content === 'string' && msg.content.trim()) return false;
+  if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length) return false;
+  return true;
+}
+const isTransientFailure = (l) => !l || !!l.netError || l.status === 429 || l.status >= 500 ||
+  TRANSIENT_RE.test(errText(l.out?.error?.message || '')) ||
+  (l.status === 200 && isEmptyCompletion(l.out));
+
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
@@ -559,92 +601,116 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
   req.on('close', onClientClose);
   try {
-    for (const attempt of attempts) {
-      const t1 = Date.now();
-      const ctrl = new AbortController();
-      activeCtrl = ctrl;
-      const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
-      try {
-        if (stream) {
-          const send = injectPrefs(body, modelId, attempt);
-          const acc = pickAccount();
-          let up = null;
-          let netError = null;
-          try {
-            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
-          } catch (e) { netError = e.message; }
-          const ctype = up?.headers?.get('content-type') || '';
-          let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
-          // 网关对流式错误可能返回 200 + text/event-stream，body 却是 {"error":...}：
-          // 读首个数据块探测，真正的 SSE 第一行是 "data: {...}" 且非纯错误对象
-          let firstChunk = null;
-          if (isSSE) {
-            let reader = null;
+    // 全部候选都因瞬时故障失败时，间隔 400/800ms 整体重放（最多两轮），吸收网关抖动
+    for (let round = 0; ; round++) {
+      for (const attempt of attempts) {
+        const t1 = Date.now();
+        const ctrl = new AbortController();
+        activeCtrl = ctrl;
+        const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
+        try {
+          if (stream) {
+            const send = injectPrefs(body, modelId, attempt);
+            const acc = pickAccount();
+            let up = null;
+            let netError = null;
             try {
-              reader = up.body.getReader();
-              const { value, done } = await reader.read();
-              if (done) {
-                isSSE = false;
-                netError = 'empty stream';
-              } else {
-                firstChunk = Buffer.from(value);
-                const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
-                if (head.startsWith('data:')) {
-                  const payload = head.replace(/^data:\s*/, '').slice(0, 160);
-                  if (payload.startsWith('{"error"')) { isSSE = false; netError = `stream error: ${payload.slice(0, 120)}`; }
-                } else {
+              up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
+            } catch (e) { netError = e.message; }
+            const ctype = up?.headers?.get('content-type') || '';
+            let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
+            // 网关对流式错误可能返回 200 + text/event-stream，body 却是 {"error":...}：
+            // 读首个数据块探测，真正的 SSE 第一行是 "data: {...}" 且非纯错误对象
+            let firstChunk = null;
+            if (isSSE) {
+              let reader = null;
+              try {
+                reader = up.body.getReader();
+                const { value, done } = await reader.read();
+                if (done) {
                   isSSE = false;
-                  netError = `unexpected stream head: ${head.slice(0, 60)}`;
+                  netError = 'empty stream';
+                } else {
+                  firstChunk = Buffer.from(value);
+                  const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
+                  if (head.startsWith('data:')) {
+                    const payload = head.replace(/^data:\s*/, '').slice(0, 160);
+                    if (payload.startsWith('{"error"')) { isSSE = false; netError = `stream error: ${payload.slice(0, 120)}`; }
+                  } else {
+                    isSSE = false;
+                    netError = `unexpected stream head: ${head.slice(0, 60)}`;
+                  }
+                }
+              } catch (e) {
+                isSSE = false;
+                netError = e.message;
+              } finally {
+                try { reader?.releaseLock(); } catch {}
+              }
+            }
+            const ms = Date.now() - t1;
+            if (up && !isSSE) {
+              let text = '';
+              let json = null;
+              if (firstChunk) {
+                // 已消费的块 + 剩余 body 拼回完整错误文本
+                const rest = await up.text().catch(() => '');
+                text = firstChunk.toString('utf8') + rest;
+              } else {
+                text = await up.text();
+              }
+              try { json = JSON.parse(text); } catch {}
+              // 网关会以 200 + 非 SSE 体应答流式请求失败，两种形态：
+              // JSON 错误体 {"error":...}；或 SSE 形式的错误体 `data: {"error":...}`（JSON.parse 会失败）。
+              // 旧逻辑在 parse 失败时误标为 up.status=200 透传，客户端拿到无 choices 的 200 → empty response。
+              let msg = errText(json?.error?.message ?? json?.error) || netError || '';
+              if (!msg) {
+                const dataLine = /^data:\s*(\{.*\})/m.exec(text);
+                if (dataLine) {
+                  try {
+                    const inner = JSON.parse(dataLine[1]).error;
+                    msg = (typeof inner?.message === 'string' && inner.message) || errText(inner);
+                  } catch { /* 非 JSON 行 */ }
                 }
               }
-            } catch (e) {
-              isSSE = false;
-              netError = e.message;
-            } finally {
-              try { reader?.releaseLock(); } catch {}
+              if (!msg) msg = text.slice(0, 160);
+              // 流式请求拿到没有 choices 的响应体一律视为失败（有 choices = 网关忽略了 stream 返回完整 JSON，照常透传）
+              const failed = !json || json.error || !json.choices;
+              trace.push({ upstream: attempt.upstream, status: failed ? 502 : up.status, ms, note: msg.slice(0, 160) });
+              if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
+              if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
+              last = {
+                status: failed ? 502 : up.status,
+                out: (json && (json.choices || json.error)) ? json : { error: { message: msg.slice(0, 400) || 'unexpected non-SSE stream response', type: 'upstream_error' } },
+                routing: parseRouting(json || {}), acc, netError: null,
+              };
+              continue; // 错误：还未向客户端写任何字节，可切换下一候选
             }
+            if (!up) {
+              trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
+              last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
+              continue;
+            }
+            // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
+            keepCloseHook = true;
+            trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
+            return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
           }
+          // 非流式
+          const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
           const ms = Date.now() - t1;
-          if (up && !isSSE) {
-            let text = '';
-            let json = null;
-            if (firstChunk) {
-              // 已消费的块 + 剩余 body 拼回完整错误文本
-              const rest = await up.text().catch(() => '');
-              text = firstChunk.toString('utf8') + rest;
-            } else {
-              text = await up.text();
-            }
-            try { json = JSON.parse(text); } catch {}
-            const msg = errText(json?.error) || text.slice(0, 160) || netError;
-            trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
-            if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
-            if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
-            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
-            continue; // 错误：还未向客户端写任何字节，可切换下一候选
-          }
-          if (!up) {
-            trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
-            last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
-            continue;
-          }
-          // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
-          keepCloseHook = true;
-          trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
-          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
+          const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : (isEmptyCompletion(r.out) ? 'empty content' : 'ok'));
+          trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
+          if (r.status !== 200 && attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, errText(r.out?.error?.message));
+          if (r.status !== 200 && !attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, r.netError || note);
+          last = r;
+          if (r.status === 200 && !isEmptyCompletion(r.out)) break;
+        } finally {
+          clearTimeout(timer);
         }
-        // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
-        const ms = Date.now() - t1;
-        const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
-        trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
-        if (r.status !== 200 && attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, errText(r.out?.error?.message));
-        if (r.status !== 200 && !attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, r.netError || note);
-        last = r;
-        if (r.status === 200) break;
-      } finally {
-        clearTimeout(timer);
       }
+      if (round >= 2 || (last && last.status === 200 && !isEmptyCompletion(last.out)) || !isTransientFailure(last)) break;
+      await new Promise((r) => setTimeout(r, 400 * (round + 1)));
     }
   } finally {
     if (!keepCloseHook) req.off('close', onClientClose);
@@ -708,7 +774,11 @@ async function handleChat(req, res) {
         cb();
       },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    // 流上任何环节出错都不允许带崩进程：上游中断或 tap 内异常时直接断开响应
+    const src = Readable.fromWeb(up.body);
+    src.on('error', () => { try { res.destroy(); } catch { /* 已断开 */ } });
+    tap.on('error', () => { try { res.destroy(); } catch { /* 已断开 */ } });
+    src.pipe(tap).pipe(res);
     return;
   }
 
